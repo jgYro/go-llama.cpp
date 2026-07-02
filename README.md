@@ -31,6 +31,10 @@ cd go-llama.cpp
 make libbinding.a
 ```
 
+On macOS, the Go bindings include the Darwin framework link flags needed by
+the default Accelerate/Metal `llama.cpp` build, so plain `go test ./...` and
+editor LSP builds should work after `libbinding.a` is built.
+
 Now you can run the example with:
 
 ```
@@ -88,7 +92,7 @@ ggml_opencl: device FP16 support: true
 
 ```
 BUILD_TYPE=metal make libbinding.a
-CGO_LDFLAGS="-framework Foundation -framework Metal -framework MetalKit -framework MetalPerformanceShaders" LIBRARY_PATH=$PWD C_INCLUDE_PATH=$PWD go build ./examples/main.go
+LIBRARY_PATH=$PWD C_INCLUDE_PATH=$PWD go build ./examples/main.go
 cp build/bin/ggml-metal.metal .
 ./main -m "/model/path/here" -t 1 -ngl 1
 ```

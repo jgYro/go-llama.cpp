@@ -7,6 +7,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -33,6 +34,19 @@ void sigint_handler(int signo) {
 }
 #endif
 
+static int copy_result_string(const std::string & src, char ** result) {
+    if (result == NULL) {
+        return 1;
+    }
+
+    *result = (char *) malloc(src.size() + 1);
+    if (*result == NULL) {
+        return 1;
+    }
+
+    memcpy(*result, src.c_str(), src.size() + 1);
+    return 0;
+}
 
 int get_embeddings(void* params_ptr, void* state_pr, float * res_embeddings) {
     gpt_params* params_p = (gpt_params*) params_ptr;
@@ -72,6 +86,14 @@ int get_embeddings(void* params_ptr, void* state_pr, float * res_embeddings) {
     return 0;
 }
 
+int llama_embedding_size(void* state_pr) {
+    llama_binding_state* state = (llama_binding_state*) state_pr;
+    if (state == NULL || state->ctx == NULL) {
+        return 0;
+    }
+
+    return llama_n_embd(state->ctx);
+}
 
 int get_token_embeddings(void* params_ptr, void* state_pr,  int *tokens, int tokenSize, float * res_embeddings) {
     gpt_params* params_p = (gpt_params*) params_ptr;
@@ -116,7 +138,7 @@ static std::vector<llama_token> * g_input_tokens;
 static std::ostringstream       * g_output_ss;
 static std::vector<llama_token> * g_output_tokens;
 
-int llama_predict(void* params_ptr, void* state_pr, char* result, bool debug) {
+int llama_predict(void* params_ptr, void* state_pr, char** result, bool debug) {
     gpt_params* params_p = (gpt_params*) params_ptr;
     llama_binding_state* state = (llama_binding_state*) state_pr;
     llama_context* ctx = state->ctx;
@@ -289,7 +311,6 @@ int llama_predict(void* params_ptr, void* state_pr, char* result, bool debug) {
     std::fill(last_tokens.begin(), last_tokens.end(), 0);
 
     bool is_antiprompt        = false;
-    bool input_echo           = true;
     bool need_to_save_session = !path_session.empty() && n_matching_session_tokens < embd_inp.size();
 
     int n_past             = 0;
@@ -330,7 +351,7 @@ int llama_predict(void* params_ptr, void* state_pr, char* result, bool debug) {
             // Ensure the input doesn't exceed the context size by truncating embd if necessary.
             if ((int)embd.size() > max_embd_size) {
                 const int skipped_tokens = (int) embd.size() - max_embd_size;
-                printf("<<input too long: skipped %zu token%s>>", skipped_tokens, skipped_tokens != 1 ? "s" : "");
+                printf("<<input too long: skipped %d token%s>>", skipped_tokens, skipped_tokens != 1 ? "s" : "");
                 embd.resize(max_embd_size);
             }
             // infinite text generation via context swapping
@@ -463,7 +484,7 @@ int llama_predict(void* params_ptr, void* state_pr, char* result, bool debug) {
             // call the token callback, no need to check if one is actually registered, that will
             // be handled on the Go side.
             auto token_str = llama_token_to_piece(ctx, id);
-            if (!tokenCallback(state_pr, (char*)token_str.c_str())) {
+            if (!tokenCallback(state_pr, const_cast<char *>(token_str.c_str()))) {
                 break;
             }
         } else {
@@ -538,7 +559,6 @@ int llama_predict(void* params_ptr, void* state_pr, char* result, bool debug) {
         llama_save_session_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.size());
     }
 
-end:
 #if defined (_WIN32)
     signal(SIGINT, SIG_DFL);
 #endif
@@ -551,16 +571,13 @@ end:
         llama_grammar_free(grammar);
     }
 
-    llama_backend_free();
-
-    strcpy(result, res.c_str()); 
-    return 0;
+    return copy_result_string(res, result);
 }
 
 // this is a bit of a hack now - ideally this should be in the predict function
 // and be transparent to the caller, however this now maps 1:1 (mostly) the upstream implementation
 // Note: both model have to be loaded with perplexity "true" to enable all logits
-int speculative_sampling(void* params_ptr, void* target_model, void* draft_model, char* result, bool debug) {
+int speculative_sampling(void* params_ptr, void* target_model, void* draft_model, char** result, bool debug) {
 
     gpt_params* params_p = (gpt_params*) params_ptr;
     llama_binding_state* target_model_state = (llama_binding_state*) target_model;
@@ -569,9 +586,6 @@ int speculative_sampling(void* params_ptr, void* target_model, void* draft_model
     gpt_params params = *params_p;
     llama_context * ctx_tgt = target_model_state->ctx;
     llama_context * ctx_dft  = draft_model_state->ctx;
-
-    llama_model * model_tgt = target_model_state->model;
-    llama_model * model_dft = draft_model_state->model;
 
     std::string res = "";
 
@@ -663,7 +677,7 @@ int speculative_sampling(void* params_ptr, void* target_model, void* draft_model
             //LOG("last: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx_tgt, last_tokens));
 
             const std::string token_str = llama_token_to_piece(ctx_tgt, id);
-            if (!tokenCallback(draft_model, (char*)token_str.c_str())) {
+            if (!tokenCallback(target_model, const_cast<char *>(token_str.c_str()))) {
                 break;
             }       
             res += token_str.c_str();
@@ -799,14 +813,22 @@ int speculative_sampling(void* params_ptr, void* target_model, void* draft_model
         llama_grammar_free(grammar_dft);
         llama_grammar_free(grammar_tgt);
     }
-    strcpy(result, res.c_str()); 
-    return 0;
+    return copy_result_string(res, result);
 }
 
 void llama_binding_free_model(void *state_ptr) {
     llama_binding_state* ctx = (llama_binding_state*) state_ptr;
-    llama_free(ctx->ctx);
-    delete ctx->model;
+    if (ctx == NULL) {
+        return;
+    }
+    if (ctx->ctx != NULL) {
+        llama_free(ctx->ctx);
+    }
+    if (ctx->model != NULL) {
+        llama_free_model(ctx->model);
+    }
+    llama_backend_free();
+    delete ctx;
 }
 
 void llama_free_params(void* params_ptr) {
@@ -837,45 +859,73 @@ void delete_vector(std::vector<std::string>* vec) {
     delete vec;
 }
 
-int load_state(void *ctx, char *statefile, char*modes) {
-    llama_context* state = (llama_context*) ctx;
-const llama_context* constState = static_cast<const llama_context*>(state);
+int load_state(void *state_ptr, char *statefile, char*modes) {
+    llama_binding_state* binding_state = (llama_binding_state*) state_ptr;
+    if (binding_state == NULL || binding_state->ctx == NULL) {
+        return 1;
+    }
+
+    llama_context* state = binding_state->ctx;
+    const llama_context* constState = static_cast<const llama_context*>(state);
     const size_t state_size = llama_get_state_size(state);
-    uint8_t * state_mem = new uint8_t[state_size];
+    std::vector<uint8_t> state_mem(state_size);
 
   {
         FILE *fp_read = fopen(statefile, modes);
+        if (fp_read == NULL) {
+            fprintf(stderr, "\n%s : failed to open state file\n", __func__);
+            return 1;
+        }
+
         if (state_size != llama_get_state_size(constState)) {
             fprintf(stderr, "\n%s : failed to validate state size\n", __func__);
+            fclose(fp_read);
             return 1;
         }
 
-        const size_t ret = fread(state_mem, 1, state_size, fp_read);
+        const size_t ret = fread(state_mem.data(), 1, state_size, fp_read);
         if (ret != state_size) {
             fprintf(stderr, "\n%s : failed to read state\n", __func__);
+            fclose(fp_read);
             return 1;
         }
 
-        llama_set_state_data(state, state_mem);  // could also read directly from memory mapped file
+        llama_set_state_data(state, state_mem.data());  // could also read directly from memory mapped file
         fclose(fp_read);
     }
 
     return 0;
 }
 
-void save_state(void *ctx, char *dst, char*modes) {
-    llama_context* state = (llama_context*) ctx;
+int save_state(void *state_ptr, char *dst, char*modes) {
+    llama_binding_state* binding_state = (llama_binding_state*) state_ptr;
+    if (binding_state == NULL || binding_state->ctx == NULL) {
+        return 1;
+    }
+
+    llama_context* state = binding_state->ctx;
 
     const size_t state_size = llama_get_state_size(state);
-    uint8_t * state_mem = new uint8_t[state_size];
+    std::vector<uint8_t> state_mem(state_size);
 
     // Save state (rng, logits, embedding and kv_cache) to file
     {
         FILE *fp_write = fopen(dst, modes);
-        llama_copy_state_data(state, state_mem); // could also copy directly to memory mapped file
-        fwrite(state_mem, 1, state_size, fp_write);
+        if (fp_write == NULL) {
+            fprintf(stderr, "\n%s : failed to open state file\n", __func__);
+            return 1;
+        }
+
+        llama_copy_state_data(state, state_mem.data()); // could also copy directly to memory mapped file
+        const size_t ret = fwrite(state_mem.data(), 1, state_size, fp_write);
         fclose(fp_write);
+        if (ret != state_size) {
+            fprintf(stderr, "\n%s : failed to write state\n", __func__);
+            return 1;
+        }
     }
+
+    return 0;
 }
 
 void* llama_allocate_params(const char *prompt, int seed, int threads, int tokens, int top_k,

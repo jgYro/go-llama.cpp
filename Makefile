@@ -229,12 +229,14 @@ llama.cpp/llama.o: llama.cpp/ggml.o
 llama.cpp/common.o: llama.cpp/ggml.o
 	cd build && cp -rf common/CMakeFiles/common.dir/common.cpp.o ../llama.cpp/common.o
 
-binding.o: prepare
-	$(CXX) $(CXXFLAGS) -I./llama.cpp -I./llama.cpp/common binding.cpp -o binding.o -c $(LDFLAGS)
+binding.o: prepare binding.cpp binding.h
+	$(CXX) $(CXXFLAGS) -I./llama.cpp -I./llama.cpp/common binding.cpp -o binding.o -c
 
 ## https://github.com/ggerganov/llama.cpp/pull/1902
 prepare:
-	cd llama.cpp && patch -p1 < ../patches/1902-cuda.patch
+	@if ! grep -q "load_binding_model" llama.cpp/common/common.h; then \
+		cd llama.cpp && patch -p1 < ../patches/1902-cuda.patch; \
+	fi
 	touch $@
 
 libbinding.a: llama.cpp/ggml.o llama.cpp/k_quants.o llama.cpp/ggml-alloc.o llama.cpp/common.o llama.cpp/grammar-parser.o llama.cpp/llama.o binding.o $(EXTRA_TARGETS)

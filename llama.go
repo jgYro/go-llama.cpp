@@ -2,14 +2,13 @@ package llama
 
 // #cgo CXXFLAGS: -I${SRCDIR}/llama.cpp/common -I${SRCDIR}/llama.cpp
 // #cgo LDFLAGS: -L${SRCDIR}/ -lbinding -lm -lstdc++
-// #cgo darwin LDFLAGS: -framework Accelerate
+// #cgo darwin LDFLAGS: -framework Accelerate -framework Foundation -framework Metal -framework MetalKit -framework MetalPerformanceShaders
 // #cgo darwin CXXFLAGS: -std=c++11
 // #include "binding.h"
 // #include <stdlib.h>
 import "C"
 import (
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"unsafe"
@@ -21,6 +20,59 @@ type LLama struct {
 	contextSize int
 }
 
+type cPredictParams struct {
+	ptr      unsafe.Pointer
+	prompt   *C.char
+	cstrings []*C.char
+}
+
+func (p *cPredictParams) cString(s string) *C.char {
+	cs := C.CString(s)
+	p.cstrings = append(p.cstrings, cs)
+	return cs
+}
+
+func (p *cPredictParams) free() {
+	if p.ptr != nil {
+		C.llama_free_params(p.ptr)
+		p.ptr = nil
+	}
+	for _, cs := range p.cstrings {
+		C.free(unsafe.Pointer(cs))
+	}
+	p.cstrings = nil
+}
+
+func newCPredictParams(prompt string, po PredictOptions) *cPredictParams {
+	params := &cPredictParams{}
+	input := params.cString(prompt)
+	params.prompt = input
+
+	reverseCount := len(po.StopPrompts)
+	reversePrompt := make([]*C.char, reverseCount)
+	var pass **C.char
+	for i, s := range po.StopPrompts {
+		reversePrompt[i] = params.cString(s)
+		pass = &reversePrompt[0]
+	}
+
+	params.ptr = C.llama_allocate_params(input, C.int(po.Seed), C.int(po.Threads), C.int(po.Tokens), C.int(po.TopK),
+		C.float(po.TopP), C.float(po.Temperature), C.float(po.Penalty), C.int(po.Repeat),
+		C.bool(po.IgnoreEOS), C.bool(po.F16KV),
+		C.int(po.Batch), C.int(po.NKeep), pass, C.int(reverseCount),
+		C.float(po.TailFreeSamplingZ), C.float(po.TypicalP), C.float(po.FrequencyPenalty), C.float(po.PresencePenalty),
+		C.int(po.Mirostat), C.float(po.MirostatETA), C.float(po.MirostatTAU), C.bool(po.PenalizeNL), params.cString(po.LogitBias),
+		params.cString(po.PathPromptCache), C.bool(po.PromptCacheAll), C.bool(po.MLock), C.bool(po.MMap),
+		params.cString(po.MainGPU), params.cString(po.TensorSplit),
+		C.bool(po.PromptCacheRO),
+		params.cString(po.Grammar),
+		C.float(po.RopeFreqBase), C.float(po.RopeFreqScale), C.float(po.NegativePromptScale), params.cString(po.NegativePrompt),
+		C.int(po.NDraft),
+	)
+
+	return params
+}
+
 func New(model string, opts ...ModelOption) (*LLama, error) {
 	mo := NewModelOptions(opts...)
 	modelPath := C.CString(model)
@@ -29,6 +81,10 @@ func New(model string, opts ...ModelOption) (*LLama, error) {
 	defer C.free(unsafe.Pointer(loraBase))
 	loraAdapter := C.CString(mo.LoraAdapter)
 	defer C.free(unsafe.Pointer(loraAdapter))
+	mainGPU := C.CString(mo.MainGPU)
+	defer C.free(unsafe.Pointer(mainGPU))
+	tensorSplit := C.CString(mo.TensorSplit)
+	defer C.free(unsafe.Pointer(tensorSplit))
 
 	MulMatQ := true
 
@@ -39,7 +95,7 @@ func New(model string, opts ...ModelOption) (*LLama, error) {
 	result := C.load_model(modelPath,
 		C.int(mo.ContextSize), C.int(mo.Seed),
 		C.bool(mo.F16Memory), C.bool(mo.MLock), C.bool(mo.Embeddings), C.bool(mo.MMap), C.bool(mo.LowVRAM),
-		C.int(mo.NGPULayers), C.int(mo.NBatch), C.CString(mo.MainGPU), C.CString(mo.TensorSplit), C.bool(mo.NUMA),
+		C.int(mo.NGPULayers), C.int(mo.NBatch), mainGPU, tensorSplit, C.bool(mo.NUMA),
 		C.float(mo.FreqRopeBase), C.float(mo.FreqRopeScale),
 		C.bool(MulMatQ), loraAdapter, loraBase, C.bool(mo.Perplexity),
 	)
@@ -53,17 +109,21 @@ func New(model string, opts ...ModelOption) (*LLama, error) {
 }
 
 func (l *LLama) Free() {
+	if l.state == nil {
+		return
+	}
+	setCallback(l.state, nil)
 	C.llama_binding_free_model(l.state)
+	l.state = nil
 }
 
 func (l *LLama) LoadState(state string) error {
 	d := C.CString(state)
 	w := C.CString("rb")
-	result := C.load_state(l.state, d, w)
-
 	defer C.free(unsafe.Pointer(d)) // free allocated C string
 	defer C.free(unsafe.Pointer(w)) // free allocated C string
 
+	result := C.load_state(l.state, d, w)
 	if result != 0 {
 		return fmt.Errorf("error while loading state")
 	}
@@ -74,14 +134,22 @@ func (l *LLama) LoadState(state string) error {
 func (l *LLama) SaveState(dst string) error {
 	d := C.CString(dst)
 	w := C.CString("wb")
-
-	C.save_state(l.state, d, w)
-
 	defer C.free(unsafe.Pointer(d)) // free allocated C string
 	defer C.free(unsafe.Pointer(w)) // free allocated C string
 
-	_, err := os.Stat(dst)
-	return err
+	if C.save_state(l.state, d, w) != 0 {
+		return fmt.Errorf("error while saving state")
+	}
+
+	return nil
+}
+
+func (l *LLama) embeddingSize() (int, error) {
+	size := int(C.llama_embedding_size(l.state))
+	if size <= 0 {
+		return 0, fmt.Errorf("invalid embedding size %d", size)
+	}
+	return size, nil
 }
 
 // Token Embeddings
@@ -92,40 +160,25 @@ func (l *LLama) TokenEmbeddings(tokens []int, opts ...PredictOption) ([]float32,
 
 	po := NewPredictOptions(opts...)
 
-	outSize := po.Tokens
-	if po.Tokens == 0 {
-		outSize = 9999999
+	outSize, err := l.embeddingSize()
+	if err != nil {
+		return nil, err
 	}
-
 	floats := make([]float32, outSize)
 
-	myArray := (*C.int)(C.malloc(C.size_t(len(tokens)) * C.sizeof_int))
-
-	// Copy the values from the Go slice to the C array
-	for i, v := range tokens {
-		(*[1<<31 - 1]int32)(unsafe.Pointer(myArray))[i] = int32(v)
+	var myArray *C.int
+	if len(tokens) > 0 {
+		myArray = (*C.int)(C.malloc(C.size_t(len(tokens)) * C.sizeof_int))
+		defer C.free(unsafe.Pointer(myArray))
+		for i, v := range tokens {
+			(*[1<<31 - 1]int32)(unsafe.Pointer(myArray))[i] = int32(v)
+		}
 	}
-	// void* llama_allocate_params(const char *prompt, int seed, int threads, int tokens,
-	// int top_k, float top_p, float temp, float repeat_penalty,
-	// int repeat_last_n, bool ignore_eos, bool memory_f16,
-	// int n_batch, int n_keep, const char** antiprompt, int antiprompt_count,
-	// float tfs_z, float typical_p, float frequency_penalty, float presence_penalty, int mirostat, float mirostat_eta, float mirostat_tau, bool penalize_nl, const char *logit_bias, const char *session_file, bool prompt_cache_all, bool mlock, bool mmap, const char *maingpu, const char *tensorsplit , bool prompt_cache_ro,
-	// float rope_freq_base, float rope_freq_scale, float negative_prompt_scale, const char* negative_prompt
-	// );
-	params := C.llama_allocate_params(C.CString(""), C.int(po.Seed), C.int(po.Threads), C.int(po.Tokens), C.int(po.TopK),
-		C.float(po.TopP), C.float(po.Temperature), C.float(po.Penalty), C.int(po.Repeat),
-		C.bool(po.IgnoreEOS), C.bool(po.F16KV),
-		C.int(po.Batch), C.int(po.NKeep), nil, C.int(0),
-		C.float(po.TailFreeSamplingZ), C.float(po.TypicalP), C.float(po.FrequencyPenalty), C.float(po.PresencePenalty),
-		C.int(po.Mirostat), C.float(po.MirostatETA), C.float(po.MirostatTAU), C.bool(po.PenalizeNL), C.CString(po.LogitBias),
-		C.CString(po.PathPromptCache), C.bool(po.PromptCacheAll), C.bool(po.MLock), C.bool(po.MMap),
-		C.CString(po.MainGPU), C.CString(po.TensorSplit),
-		C.bool(po.PromptCacheRO),
-		C.CString(po.Grammar),
-		C.float(po.RopeFreqBase), C.float(po.RopeFreqScale), C.float(po.NegativePromptScale), C.CString(po.NegativePrompt),
-		C.int(po.NDraft),
-	)
-	ret := C.get_token_embeddings(params, l.state, myArray, C.int(len(tokens)), (*C.float)(&floats[0]))
+
+	params := newCPredictParams("", po)
+	defer params.free()
+
+	ret := C.get_token_embeddings(params.ptr, l.state, myArray, C.int(len(tokens)), (*C.float)(&floats[0]))
 	if ret != 0 {
 		return floats, fmt.Errorf("embedding inference failed")
 	}
@@ -140,35 +193,20 @@ func (l *LLama) Embeddings(text string, opts ...PredictOption) ([]float32, error
 
 	po := NewPredictOptions(opts...)
 
-	input := C.CString(text)
 	if po.Tokens == 0 {
 		po.Tokens = 99999999
 	}
-	floats := make([]float32, po.Tokens)
-	reverseCount := len(po.StopPrompts)
-	reversePrompt := make([]*C.char, reverseCount)
-	var pass **C.char
-	for i, s := range po.StopPrompts {
-		cs := C.CString(s)
-		reversePrompt[i] = cs
-		pass = &reversePrompt[0]
+
+	outSize, err := l.embeddingSize()
+	if err != nil {
+		return nil, err
 	}
+	floats := make([]float32, outSize)
 
-	params := C.llama_allocate_params(input, C.int(po.Seed), C.int(po.Threads), C.int(po.Tokens), C.int(po.TopK),
-		C.float(po.TopP), C.float(po.Temperature), C.float(po.Penalty), C.int(po.Repeat),
-		C.bool(po.IgnoreEOS), C.bool(po.F16KV),
-		C.int(po.Batch), C.int(po.NKeep), pass, C.int(reverseCount),
-		C.float(po.TailFreeSamplingZ), C.float(po.TypicalP), C.float(po.FrequencyPenalty), C.float(po.PresencePenalty),
-		C.int(po.Mirostat), C.float(po.MirostatETA), C.float(po.MirostatTAU), C.bool(po.PenalizeNL), C.CString(po.LogitBias),
-		C.CString(po.PathPromptCache), C.bool(po.PromptCacheAll), C.bool(po.MLock), C.bool(po.MMap),
-		C.CString(po.MainGPU), C.CString(po.TensorSplit),
-		C.bool(po.PromptCacheRO),
-		C.CString(po.Grammar),
-		C.float(po.RopeFreqBase), C.float(po.RopeFreqScale), C.float(po.NegativePromptScale), C.CString(po.NegativePrompt),
-		C.int(po.NDraft),
-	)
+	params := newCPredictParams(text, po)
+	defer params.free()
 
-	ret := C.get_embeddings(params, l.state, (*C.float)(&floats[0]))
+	ret := C.get_embeddings(params.ptr, l.state, (*C.float)(&floats[0]))
 	if ret != 0 {
 		return floats, fmt.Errorf("embedding inference failed")
 	}
@@ -179,39 +217,17 @@ func (l *LLama) Embeddings(text string, opts ...PredictOption) ([]float32, error
 func (l *LLama) Eval(text string, opts ...PredictOption) error {
 	po := NewPredictOptions(opts...)
 
-	input := C.CString(text)
 	if po.Tokens == 0 {
 		po.Tokens = 99999999
 	}
 
-	reverseCount := len(po.StopPrompts)
-	reversePrompt := make([]*C.char, reverseCount)
-	var pass **C.char
-	for i, s := range po.StopPrompts {
-		cs := C.CString(s)
-		reversePrompt[i] = cs
-		pass = &reversePrompt[0]
-	}
+	params := newCPredictParams(text, po)
+	defer params.free()
 
-	params := C.llama_allocate_params(input, C.int(po.Seed), C.int(po.Threads), C.int(po.Tokens), C.int(po.TopK),
-		C.float(po.TopP), C.float(po.Temperature), C.float(po.Penalty), C.int(po.Repeat),
-		C.bool(po.IgnoreEOS), C.bool(po.F16KV),
-		C.int(po.Batch), C.int(po.NKeep), pass, C.int(reverseCount),
-		C.float(po.TailFreeSamplingZ), C.float(po.TypicalP), C.float(po.FrequencyPenalty), C.float(po.PresencePenalty),
-		C.int(po.Mirostat), C.float(po.MirostatETA), C.float(po.MirostatTAU), C.bool(po.PenalizeNL), C.CString(po.LogitBias),
-		C.CString(po.PathPromptCache), C.bool(po.PromptCacheAll), C.bool(po.MLock), C.bool(po.MMap),
-		C.CString(po.MainGPU), C.CString(po.TensorSplit),
-		C.bool(po.PromptCacheRO),
-		C.CString(po.Grammar),
-		C.float(po.RopeFreqBase), C.float(po.RopeFreqScale), C.float(po.NegativePromptScale), C.CString(po.NegativePrompt),
-		C.int(po.NDraft),
-	)
-	ret := C.eval(params, l.state, input)
+	ret := C.eval(params.ptr, l.state, params.prompt)
 	if ret != 0 {
 		return fmt.Errorf("inference failed")
 	}
-
-	C.llama_free_params(params)
 
 	return nil
 }
@@ -221,57 +237,27 @@ func (l *LLama) SpeculativeSampling(ll *LLama, text string, opts ...PredictOptio
 
 	if po.TokenCallback != nil {
 		setCallback(l.state, po.TokenCallback)
+		defer setCallback(l.state, nil)
 	}
 
-	input := C.CString(text)
 	if po.Tokens == 0 {
 		po.Tokens = 99999999
 	}
-	out := make([]byte, po.Tokens)
 
-	reverseCount := len(po.StopPrompts)
-	reversePrompt := make([]*C.char, reverseCount)
-	var pass **C.char
-	for i, s := range po.StopPrompts {
-		cs := C.CString(s)
-		reversePrompt[i] = cs
-		pass = &reversePrompt[0]
-	}
+	params := newCPredictParams(text, po)
+	defer params.free()
 
-	params := C.llama_allocate_params(input, C.int(po.Seed), C.int(po.Threads), C.int(po.Tokens), C.int(po.TopK),
-		C.float(po.TopP), C.float(po.Temperature), C.float(po.Penalty), C.int(po.Repeat),
-		C.bool(po.IgnoreEOS), C.bool(po.F16KV),
-		C.int(po.Batch), C.int(po.NKeep), pass, C.int(reverseCount),
-		C.float(po.TailFreeSamplingZ), C.float(po.TypicalP), C.float(po.FrequencyPenalty), C.float(po.PresencePenalty),
-		C.int(po.Mirostat), C.float(po.MirostatETA), C.float(po.MirostatTAU), C.bool(po.PenalizeNL), C.CString(po.LogitBias),
-		C.CString(po.PathPromptCache), C.bool(po.PromptCacheAll), C.bool(po.MLock), C.bool(po.MMap),
-		C.CString(po.MainGPU), C.CString(po.TensorSplit),
-		C.bool(po.PromptCacheRO),
-		C.CString(po.Grammar),
-		C.float(po.RopeFreqBase), C.float(po.RopeFreqScale), C.float(po.NegativePromptScale), C.CString(po.NegativePrompt),
-		C.int(po.NDraft),
-	)
-	ret := C.speculative_sampling(params, l.state, ll.state, (*C.char)(unsafe.Pointer(&out[0])), C.bool(po.DebugMode))
+	var out *C.char
+	ret := C.speculative_sampling(params.ptr, l.state, ll.state, &out, C.bool(po.DebugMode))
 	if ret != 0 {
 		return "", fmt.Errorf("inference failed")
 	}
-	res := C.GoString((*C.char)(unsafe.Pointer(&out[0])))
-
-	res = strings.TrimPrefix(res, " ")
-	res = strings.TrimPrefix(res, text)
-	res = strings.TrimPrefix(res, "\n")
-
-	for _, s := range po.StopPrompts {
-		res = strings.TrimRight(res, s)
+	if out == nil {
+		return "", fmt.Errorf("inference returned no output")
 	}
+	defer C.free(unsafe.Pointer(out))
 
-	C.llama_free_params(params)
-
-	if po.TokenCallback != nil {
-		setCallback(l.state, nil)
-	}
-
-	return res, nil
+	return cleanPredictionResult(C.GoString(out), text, po.StopPrompts), nil
 }
 
 func (l *LLama) Predict(text string, opts ...PredictOption) (string, error) {
@@ -279,57 +265,41 @@ func (l *LLama) Predict(text string, opts ...PredictOption) (string, error) {
 
 	if po.TokenCallback != nil {
 		setCallback(l.state, po.TokenCallback)
+		defer setCallback(l.state, nil)
 	}
 
-	input := C.CString(text)
 	if po.Tokens == 0 {
 		po.Tokens = 99999999
 	}
-	out := make([]byte, po.Tokens)
 
-	reverseCount := len(po.StopPrompts)
-	reversePrompt := make([]*C.char, reverseCount)
-	var pass **C.char
-	for i, s := range po.StopPrompts {
-		cs := C.CString(s)
-		reversePrompt[i] = cs
-		pass = &reversePrompt[0]
-	}
+	params := newCPredictParams(text, po)
+	defer params.free()
 
-	params := C.llama_allocate_params(input, C.int(po.Seed), C.int(po.Threads), C.int(po.Tokens), C.int(po.TopK),
-		C.float(po.TopP), C.float(po.Temperature), C.float(po.Penalty), C.int(po.Repeat),
-		C.bool(po.IgnoreEOS), C.bool(po.F16KV),
-		C.int(po.Batch), C.int(po.NKeep), pass, C.int(reverseCount),
-		C.float(po.TailFreeSamplingZ), C.float(po.TypicalP), C.float(po.FrequencyPenalty), C.float(po.PresencePenalty),
-		C.int(po.Mirostat), C.float(po.MirostatETA), C.float(po.MirostatTAU), C.bool(po.PenalizeNL), C.CString(po.LogitBias),
-		C.CString(po.PathPromptCache), C.bool(po.PromptCacheAll), C.bool(po.MLock), C.bool(po.MMap),
-		C.CString(po.MainGPU), C.CString(po.TensorSplit),
-		C.bool(po.PromptCacheRO),
-		C.CString(po.Grammar),
-		C.float(po.RopeFreqBase), C.float(po.RopeFreqScale), C.float(po.NegativePromptScale), C.CString(po.NegativePrompt),
-		C.int(po.NDraft),
-	)
-	ret := C.llama_predict(params, l.state, (*C.char)(unsafe.Pointer(&out[0])), C.bool(po.DebugMode))
+	var out *C.char
+	ret := C.llama_predict(params.ptr, l.state, &out, C.bool(po.DebugMode))
 	if ret != 0 {
 		return "", fmt.Errorf("inference failed")
 	}
-	res := C.GoString((*C.char)(unsafe.Pointer(&out[0])))
+	if out == nil {
+		return "", fmt.Errorf("inference returned no output")
+	}
+	defer C.free(unsafe.Pointer(out))
 
+	return cleanPredictionResult(C.GoString(out), text, po.StopPrompts), nil
+}
+
+func cleanPredictionResult(res, prompt string, stopPrompts []string) string {
 	res = strings.TrimPrefix(res, " ")
-	res = strings.TrimPrefix(res, text)
+	res = strings.TrimPrefix(res, prompt)
 	res = strings.TrimPrefix(res, "\n")
 
-	for _, s := range po.StopPrompts {
-		res = strings.TrimRight(res, s)
+	for _, s := range stopPrompts {
+		if s != "" {
+			res = strings.TrimSuffix(res, s)
+		}
 	}
 
-	C.llama_free_params(params)
-
-	if po.TokenCallback != nil {
-		setCallback(l.state, nil)
-	}
-
-	return res, nil
+	return res
 }
 
 // tokenize has an interesting return property: negative lengths (potentially) have meaning.
@@ -337,30 +307,15 @@ func (l *LLama) Predict(text string, opts ...PredictOption) (string, error) {
 func (l *LLama) TokenizeString(text string, opts ...PredictOption) (int32, []int32, error) {
 	po := NewPredictOptions(opts...)
 
-	input := C.CString(text)
 	if po.Tokens == 0 {
 		po.Tokens = 4096 // ???
 	}
 	out := make([]C.int, po.Tokens)
 
-	var fakeDblPtr **C.char
+	params := newCPredictParams(text, po)
+	defer params.free()
 
-	// copy pasted and modified minimally. Should I simplify down / do we need an "allocate defaults"
-	params := C.llama_allocate_params(input, C.int(po.Seed), C.int(po.Threads), C.int(po.Tokens), C.int(po.TopK),
-		C.float(po.TopP), C.float(po.Temperature), C.float(po.Penalty), C.int(po.Repeat),
-		C.bool(po.IgnoreEOS), C.bool(po.F16KV),
-		C.int(po.Batch), C.int(po.NKeep), fakeDblPtr, C.int(0),
-		C.float(po.TailFreeSamplingZ), C.float(po.TypicalP), C.float(po.FrequencyPenalty), C.float(po.PresencePenalty),
-		C.int(po.Mirostat), C.float(po.MirostatETA), C.float(po.MirostatTAU), C.bool(po.PenalizeNL), C.CString(po.LogitBias),
-		C.CString(po.PathPromptCache), C.bool(po.PromptCacheAll), C.bool(po.MLock), C.bool(po.MMap),
-		C.CString(po.MainGPU), C.CString(po.TensorSplit),
-		C.bool(po.PromptCacheRO),
-		C.CString(po.Grammar),
-		C.float(po.RopeFreqBase), C.float(po.RopeFreqScale), C.float(po.NegativePromptScale), C.CString(po.NegativePrompt),
-		C.int(po.NDraft),
-	)
-
-	tokRet := C.llama_tokenize_string(params, l.state, (*C.int)(unsafe.Pointer(&out[0]))) //, C.int(po.Tokens), true)
+	tokRet := C.llama_tokenize_string(params.ptr, l.state, (*C.int)(unsafe.Pointer(&out[0]))) //, C.int(po.Tokens), true)
 
 	if tokRet < 0 {
 		return int32(tokRet), []int32{}, fmt.Errorf("llama_tokenize_string returned negative count %d", tokRet)
