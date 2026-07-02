@@ -8,7 +8,9 @@ package llama
 // #include <stdlib.h>
 import "C"
 import (
+	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"unsafe"
@@ -23,6 +25,30 @@ type LLama struct {
 type ChatMessage struct {
 	Role    string
 	Content string
+}
+
+type ModelInfo struct {
+	Description           string            `json:"description"`
+	Size                  uint64            `json:"size"`
+	Parameters            uint64            `json:"parameters"`
+	FType                 int               `json:"ftype"`
+	FTypeName             string            `json:"ftype_name"`
+	ContextTrain          int               `json:"context_train"`
+	EmbeddingLength       int               `json:"embedding_length"`
+	EmbeddingInputLength  int               `json:"embedding_input_length"`
+	EmbeddingOutputLength int               `json:"embedding_output_length"`
+	Layers                int               `json:"layers"`
+	Heads                 int               `json:"heads"`
+	HeadsKV               int               `json:"heads_kv"`
+	VocabSize             int               `json:"vocab_size"`
+	RopeType              int               `json:"rope_type"`
+	HasEncoder            bool              `json:"has_encoder"`
+	HasDecoder            bool              `json:"has_decoder"`
+	IsRecurrent           bool              `json:"is_recurrent"`
+	IsHybrid              bool              `json:"is_hybrid"`
+	IsDiffusion           bool              `json:"is_diffusion"`
+	ChatTemplate          string            `json:"chat_template"`
+	Metadata              map[string]string `json:"metadata"`
 }
 
 type cPredictParams struct {
@@ -61,12 +87,18 @@ func newCPredictParams(prompt string, po PredictOptions) *cPredictParams {
 		pass = &reversePrompt[0]
 	}
 
+	logitBias := params.cString(formatLogitBias(po))
+	dryBreakers := params.cString(strings.Join(po.DrySequenceBreakers, "\x1f"))
 	params.ptr = C.llama_allocate_params(input, C.int(po.Seed), C.int(po.Threads), C.int(po.Tokens), C.int(po.TopK),
 		C.float(po.TopP), C.float(po.Temperature), C.float(po.Penalty), C.int(po.Repeat),
 		C.bool(po.IgnoreEOS), C.bool(po.F16KV),
 		C.int(po.Batch), C.int(po.NKeep), pass, C.int(reverseCount),
-		C.float(po.TailFreeSamplingZ), C.float(po.TypicalP), C.float(po.FrequencyPenalty), C.float(po.PresencePenalty),
-		C.int(po.Mirostat), C.float(po.MirostatETA), C.float(po.MirostatTAU), C.bool(po.PenalizeNL), params.cString(po.LogitBias),
+		C.float(po.TailFreeSamplingZ), C.float(po.TypicalP), C.float(po.MinP), C.float(po.TopNSigma),
+		C.float(po.XTCProbability), C.float(po.XTCThreshold), C.float(po.DynamicTempRange), C.float(po.DynamicTempExponent),
+		C.float(po.AdaptivePTarget), C.float(po.AdaptivePDecay), C.float(po.DryMultiplier), C.float(po.DryBase),
+		C.int(po.DryAllowedLength), C.int(po.DryPenaltyLastN), dryBreakers,
+		C.float(po.FrequencyPenalty), C.float(po.PresencePenalty),
+		C.int(po.Mirostat), C.float(po.MirostatETA), C.float(po.MirostatTAU), C.bool(po.PenalizeNL), logitBias,
 		params.cString(po.PathPromptCache), C.bool(po.PromptCacheAll), C.bool(po.MLock), C.bool(po.MMap),
 		params.cString(po.MainGPU), params.cString(po.TensorSplit),
 		C.bool(po.PromptCacheRO),
@@ -76,6 +108,17 @@ func newCPredictParams(prompt string, po PredictOptions) *cPredictParams {
 	)
 
 	return params
+}
+
+func formatLogitBias(po PredictOptions) string {
+	var parts []string
+	if po.LogitBias != "" {
+		parts = append(parts, po.LogitBias)
+	}
+	for _, bias := range po.LogitBiases {
+		parts = append(parts, strconv.Itoa(bias.Token)+":"+strconv.FormatFloat(float64(bias.Bias), 'g', -1, 32))
+	}
+	return strings.Join(parts, ",")
 }
 
 func New(model string, opts ...ModelOption) (*LLama, error) {
@@ -102,6 +145,7 @@ func New(model string, opts ...ModelOption) (*LLama, error) {
 		C.bool(mo.F16Memory), C.bool(mo.MLock), C.bool(mo.Embeddings), C.bool(mo.MMap), C.bool(mo.LowVRAM),
 		C.int(mo.NGPULayers), C.int(mo.NBatch), mainGPU, tensorSplit, C.bool(mo.NUMA),
 		C.float(mo.FreqRopeBase), C.float(mo.FreqRopeScale),
+		C.int(mo.RopeScaling), C.int(mo.Pooling), C.int(mo.Attention), C.int(mo.FlashAttention), C.int(mo.NUBatch), C.int(mo.NSeqMax),
 		C.bool(MulMatQ), loraAdapter, loraBase, C.bool(mo.Perplexity),
 	)
 
@@ -111,6 +155,24 @@ func New(model string, opts ...ModelOption) (*LLama, error) {
 
 	ll := &LLama{state: result, contextSize: mo.ContextSize, embeddings: mo.Embeddings}
 	return ll, nil
+}
+
+func BuiltinChatTemplates() ([]string, error) {
+	var out *C.char
+	ret := C.llama_builtin_chat_templates_json(&out)
+	if ret != 0 {
+		return nil, fmt.Errorf("failed to load builtin chat templates")
+	}
+	if out == nil {
+		return nil, fmt.Errorf("builtin chat templates returned no output")
+	}
+	defer C.free(unsafe.Pointer(out))
+
+	var templates []string
+	if err := json.Unmarshal([]byte(C.GoString(out)), &templates); err != nil {
+		return nil, err
+	}
+	return templates, nil
 }
 
 func (l *LLama) Free() {
@@ -147,6 +209,28 @@ func (l *LLama) SaveState(dst string) error {
 	}
 
 	return nil
+}
+
+func (l *LLama) ModelInfo() (ModelInfo, error) {
+	if l.state == nil {
+		return ModelInfo{}, fmt.Errorf("model is not loaded")
+	}
+
+	var out *C.char
+	ret := C.llama_model_info_json(l.state, &out)
+	if ret != 0 {
+		return ModelInfo{}, fmt.Errorf("model info failed")
+	}
+	if out == nil {
+		return ModelInfo{}, fmt.Errorf("model info returned no output")
+	}
+	defer C.free(unsafe.Pointer(out))
+
+	var info ModelInfo
+	if err := json.Unmarshal([]byte(C.GoString(out)), &info); err != nil {
+		return ModelInfo{}, err
+	}
+	return info, nil
 }
 
 func (l *LLama) embeddingSize() (int, error) {
@@ -328,6 +412,39 @@ func (l *LLama) ApplyChatTemplate(messages []ChatMessage, addGenerationPrompt bo
 	}
 	if out == nil {
 		return "", fmt.Errorf("chat template formatting returned no output")
+	}
+	defer C.free(unsafe.Pointer(out))
+
+	return C.GoString(out), nil
+}
+
+func (l *LLama) Detokenize(tokens []int32, removeSpecial, unparseSpecial bool) (string, error) {
+	if l.state == nil {
+		return "", fmt.Errorf("model is not loaded")
+	}
+	if len(tokens) == 0 {
+		return "", nil
+	}
+
+	cTokens := make([]C.int, len(tokens))
+	for i, token := range tokens {
+		cTokens[i] = C.int(token)
+	}
+
+	var out *C.char
+	ret := C.llama_detokenize_tokens(
+		l.state,
+		(*C.int)(unsafe.Pointer(&cTokens[0])),
+		C.int(len(cTokens)),
+		C.bool(removeSpecial),
+		C.bool(unparseSpecial),
+		&out,
+	)
+	if ret != 0 {
+		return "", fmt.Errorf("detokenize failed")
+	}
+	if out == nil {
+		return "", fmt.Errorf("detokenize returned no output")
 	}
 	defer C.free(unsafe.Pointer(out))
 

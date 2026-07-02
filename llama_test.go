@@ -2,6 +2,7 @@ package llama_test
 
 import (
 	"os"
+	"strings"
 
 	"github.com/go-skynet/go-llama.cpp"
 	. "github.com/go-skynet/go-llama.cpp"
@@ -90,6 +91,34 @@ how much is 2+2?
 			Expect(err).ToNot(HaveOccurred())
 			Expect(l).To(BeNumerically(">", 0))
 			Expect(int(l)).To(Equal(len(tokens)))
+		})
+
+		It("detokenizes strings successfully", func() {
+			if testModelPath == "" {
+				Skip("test skipped - only makes sense if the TEST_MODEL environment variable is set.")
+			}
+
+			model, err := getModel()
+			Expect(err).ToNot(HaveOccurred())
+			_, tokens, err := model.TokenizeString("A STRANGE GAME.", SetTokens(64))
+			Expect(err).ToNot(HaveOccurred())
+			text, err := model.Detokenize(tokens, true, true)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(strings.ToUpper(text)).To(ContainSubstring("STRANGE GAME"))
+		})
+
+		It("returns model info", func() {
+			if testModelPath == "" {
+				Skip("test skipped - only makes sense if the TEST_MODEL environment variable is set.")
+			}
+
+			model, err := getModel()
+			Expect(err).ToNot(HaveOccurred())
+			info, err := model.ModelInfo()
+			Expect(err).ToNot(HaveOccurred())
+			Expect(info.VocabSize).To(BeNumerically(">", 0))
+			Expect(info.Parameters).To(BeNumerically(">", 0))
+			Expect(info.EmbeddingOutputLength).To(BeNumerically(">", 0))
 		})
 	})
 

@@ -5,6 +5,8 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -29,6 +31,18 @@ struct llama_binding_params {
     float temp;
     float repeat_penalty;
     float typical_p;
+    float min_p;
+    float top_n_sigma;
+    float xtc_probability;
+    float xtc_threshold;
+    float dynatemp_range;
+    float dynatemp_exponent;
+    float adaptive_p_target;
+    float adaptive_p_decay;
+    float dry_multiplier;
+    float dry_base;
+    int dry_allowed_length;
+    int dry_penalty_last_n;
     float frequency_penalty;
     float presence_penalty;
     int mirostat;
@@ -36,8 +50,13 @@ struct llama_binding_params {
     float mirostat_tau;
     bool ignore_eos;
     bool penalize_nl;
+    std::string session_file;
+    bool prompt_cache_all;
+    bool prompt_cache_ro;
     std::string grammar;
     std::vector<std::string> antiprompt;
+    std::vector<std::string> dry_sequence_breakers;
+    std::vector<llama_logit_bias> logit_bias;
 };
 
 struct llama_binding_state {
@@ -81,6 +100,178 @@ static int copy_result_string(const std::string & src, char ** result) {
 
     memcpy(*result, src.c_str(), src.size() + 1);
     return 0;
+}
+
+static std::string trim_copy(const std::string & value) {
+    size_t begin = 0;
+    while (begin < value.size() && std::isspace(static_cast<unsigned char>(value[begin]))) {
+        begin++;
+    }
+
+    size_t end = value.size();
+    while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1]))) {
+        end--;
+    }
+
+    return value.substr(begin, end - begin);
+}
+
+static std::vector<std::string> split_string(const std::string & value, char delimiter) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    while (start <= value.size()) {
+        size_t end = value.find(delimiter, start);
+        if (end == std::string::npos) {
+            end = value.size();
+        }
+        std::string item = value.substr(start, end - start);
+        if (!item.empty()) {
+            out.push_back(item);
+        }
+        if (end == value.size()) {
+            break;
+        }
+        start = end + 1;
+    }
+    return out;
+}
+
+static std::string json_escape(const std::string & value) {
+    std::string out;
+    out.reserve(value.size() + 8);
+    for (unsigned char ch : value) {
+        switch (ch) {
+        case '\\':
+            out += "\\\\";
+            break;
+        case '"':
+            out += "\\\"";
+            break;
+        case '\b':
+            out += "\\b";
+            break;
+        case '\f':
+            out += "\\f";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
+        default:
+            if (ch < 0x20) {
+                char buf[7];
+                snprintf(buf, sizeof(buf), "\\u%04x", ch);
+                out += buf;
+            } else {
+                out.push_back(static_cast<char>(ch));
+            }
+            break;
+        }
+    }
+    return out;
+}
+
+static bool parse_float(const std::string & value, float & out) {
+    const std::string v = trim_copy(value);
+    if (v == "-inf" || v == "-infinity" || v == "-Inf" || v == "-Infinity") {
+        out = -INFINITY;
+        return true;
+    }
+    if (v == "inf" || v == "+inf" || v == "infinity" || v == "+infinity" ||
+        v == "Inf" || v == "+Inf" || v == "Infinity" || v == "+Infinity") {
+        out = INFINITY;
+        return true;
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    float parsed = std::strtof(v.c_str(), &end);
+    if (errno != 0 || end == v.c_str()) {
+        return false;
+    }
+    while (end != nullptr && *end != '\0') {
+        if (!std::isspace(static_cast<unsigned char>(*end))) {
+            return false;
+        }
+        end++;
+    }
+    out = parsed;
+    return true;
+}
+
+static std::vector<llama_logit_bias> parse_logit_biases(const char * spec) {
+    std::vector<llama_logit_bias> biases;
+    if (spec == nullptr || spec[0] == '\0') {
+        return biases;
+    }
+
+    std::string normalized(spec);
+    std::replace(normalized.begin(), normalized.end(), ';', ',');
+    for (const std::string & raw_entry : split_string(normalized, ',')) {
+        const std::string entry = trim_copy(raw_entry);
+        if (entry.empty()) {
+            continue;
+        }
+
+        size_t sep = entry.find(':');
+        if (sep == std::string::npos) {
+            sep = entry.find('=');
+        }
+        if (sep == std::string::npos) {
+            continue;
+        }
+
+        const std::string token_text = trim_copy(entry.substr(0, sep));
+        const std::string bias_text = trim_copy(entry.substr(sep + 1));
+        char * token_end = nullptr;
+        errno = 0;
+        long token = std::strtol(token_text.c_str(), &token_end, 10);
+        if (errno != 0 || token_end == token_text.c_str() || token < 0) {
+            continue;
+        }
+        while (token_end != nullptr && *token_end != '\0') {
+            if (!std::isspace(static_cast<unsigned char>(*token_end))) {
+                token = -1;
+                break;
+            }
+            token_end++;
+        }
+        if (token < 0) {
+            continue;
+        }
+
+        float bias = 0.0f;
+        if (!parse_float(bias_text, bias)) {
+            continue;
+        }
+        biases.push_back(llama_logit_bias{static_cast<llama_token>(token), bias});
+    }
+
+    return biases;
+}
+
+static void append_json_string_field(std::string & json, const char * key, const std::string & value, bool comma = true) {
+    if (comma) {
+        json += ",";
+    }
+    json += "\"";
+    json += key;
+    json += "\":\"";
+    json += json_escape(value);
+    json += "\"";
+}
+
+static bool file_exists(const std::string & path) {
+    if (path.empty()) {
+        return false;
+    }
+    std::ifstream file(path, std::ios::binary);
+    return file.good();
 }
 
 static bool ends_with_any(const std::string & text, const std::vector<std::string> & suffixes) {
@@ -165,9 +356,13 @@ static llama_sampler * create_sampler(llama_binding_state * state, const llama_b
 
     const int n_vocab = llama_vocab_n_tokens(state->vocab);
 
-    std::vector<llama_logit_bias> biases;
+    std::vector<llama_logit_bias> biases = params->logit_bias;
     if (params->ignore_eos) {
-        biases.push_back(llama_logit_bias{llama_vocab_eos(state->vocab), -INFINITY});
+        for (llama_token token = 0; token < n_vocab; token++) {
+            if (llama_vocab_is_eog(state->vocab, token)) {
+                biases.push_back(llama_logit_bias{token, -INFINITY});
+            }
+        }
     }
     if (!biases.empty()) {
         llama_sampler_chain_add(sampler, llama_sampler_init_logit_bias(n_vocab, static_cast<int32_t>(biases.size()), biases.data()));
@@ -192,15 +387,48 @@ static llama_sampler * create_sampler(llama_binding_state * state, const llama_b
         return sampler;
     }
 
-    llama_sampler_chain_add(sampler, llama_sampler_init_top_k(params->top_k));
-    llama_sampler_chain_add(sampler, llama_sampler_init_top_p(params->top_p, 1));
-    llama_sampler_chain_add(sampler, llama_sampler_init_typical(params->typical_p, 1));
     llama_sampler_chain_add(sampler, llama_sampler_init_penalties(params->repeat, params->repeat_penalty, params->frequency_penalty, params->presence_penalty));
+
+    if (params->dry_multiplier != 0.0f) {
+        std::vector<const char *> breaker_ptrs;
+        breaker_ptrs.reserve(params->dry_sequence_breakers.size());
+        for (const auto & breaker : params->dry_sequence_breakers) {
+            breaker_ptrs.push_back(breaker.c_str());
+        }
+        llama_sampler_chain_add(
+            sampler,
+            llama_sampler_init_dry(
+                state->vocab,
+                llama_model_n_ctx_train(state->model),
+                params->dry_multiplier,
+                params->dry_base,
+                params->dry_allowed_length,
+                params->dry_penalty_last_n,
+                breaker_ptrs.empty() ? nullptr : breaker_ptrs.data(),
+                breaker_ptrs.size()));
+    }
+
+    if (params->top_n_sigma >= 0.0f) {
+        llama_sampler_chain_add(sampler, llama_sampler_init_top_n_sigma(params->top_n_sigma));
+    }
+    llama_sampler_chain_add(sampler, llama_sampler_init_top_k(params->top_k));
+    llama_sampler_chain_add(sampler, llama_sampler_init_typical(params->typical_p, 1));
+    llama_sampler_chain_add(sampler, llama_sampler_init_top_p(params->top_p, 1));
+    llama_sampler_chain_add(sampler, llama_sampler_init_min_p(params->min_p, 1));
+    if (params->xtc_probability > 0.0f) {
+        llama_sampler_chain_add(sampler, llama_sampler_init_xtc(params->xtc_probability, params->xtc_threshold, 1, static_cast<uint32_t>(params->seed)));
+    }
 
     if (params->temp <= 0.0f) {
         llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
+    } else if (params->adaptive_p_target >= 0.0f) {
+        llama_sampler_chain_add(sampler, llama_sampler_init_adaptive_p(params->adaptive_p_target, params->adaptive_p_decay, static_cast<uint32_t>(params->seed)));
     } else {
-        llama_sampler_chain_add(sampler, llama_sampler_init_temp(params->temp));
+        if (params->dynatemp_range > 0.0f) {
+            llama_sampler_chain_add(sampler, llama_sampler_init_temp_ext(params->temp, params->dynatemp_range, params->dynatemp_exponent));
+        } else {
+            llama_sampler_chain_add(sampler, llama_sampler_init_temp(params->temp));
+        }
         llama_sampler_chain_add(sampler, llama_sampler_init_dist(static_cast<uint32_t>(params->seed)));
     }
 
@@ -225,7 +453,7 @@ static int embedding_for_tokens(llama_binding_state * state, std::vector<llama_t
         return ret;
     }
 
-    const int n_embd = llama_model_n_embd(state->model);
+    const int n_embd = llama_model_n_embd_out(state->model);
     float * embeddings = llama_get_embeddings_ith(state->ctx, -1);
     if (embeddings == nullptr) {
         embeddings = llama_get_embeddings_seq(state->ctx, 0);
@@ -259,6 +487,12 @@ void* load_model(const char *fname,
                  bool numa,
                  float rope_freq_base,
                  float rope_freq_scale,
+                 int rope_scaling_type,
+                 int pooling_type,
+                 int attention_type,
+                 int flash_attention_type,
+                 int n_ubatch,
+                 int n_seq_max,
                  bool mul_mat_q,
                  const char *lora,
                  const char *lora_base,
@@ -295,11 +529,26 @@ void* load_model(const char *fname,
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = n_ctx > 0 ? static_cast<uint32_t>(n_ctx) : 0;
     ctx_params.n_batch = n_batch > 0 ? static_cast<uint32_t>(n_batch) : 512;
-    ctx_params.n_ubatch = ctx_params.n_batch;
+    ctx_params.n_ubatch = n_ubatch > 0 ? static_cast<uint32_t>(n_ubatch) : ctx_params.n_batch;
+    if (n_seq_max > 0) {
+        ctx_params.n_seq_max = static_cast<uint32_t>(n_seq_max);
+    }
     ctx_params.embeddings = embeddings;
     ctx_params.no_perf = false;
     ctx_params.rope_freq_base = rope_freq_base;
     ctx_params.rope_freq_scale = rope_freq_scale;
+    if (rope_scaling_type >= LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED && rope_scaling_type <= LLAMA_ROPE_SCALING_TYPE_MAX_VALUE) {
+        ctx_params.rope_scaling_type = static_cast<enum llama_rope_scaling_type>(rope_scaling_type);
+    }
+    if (pooling_type >= LLAMA_POOLING_TYPE_UNSPECIFIED && pooling_type <= LLAMA_POOLING_TYPE_RANK) {
+        ctx_params.pooling_type = static_cast<enum llama_pooling_type>(pooling_type);
+    }
+    if (attention_type >= LLAMA_ATTENTION_TYPE_UNSPECIFIED && attention_type <= LLAMA_ATTENTION_TYPE_NON_CAUSAL) {
+        ctx_params.attention_type = static_cast<enum llama_attention_type>(attention_type);
+    }
+    if (flash_attention_type >= LLAMA_FLASH_ATTN_TYPE_AUTO && flash_attention_type <= LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+        ctx_params.flash_attn_type = static_cast<enum llama_flash_attn_type>(flash_attention_type);
+    }
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
     if (ctx == nullptr) {
@@ -337,19 +586,15 @@ void* llama_allocate_params(const char *prompt, int seed, int threads, int token
                             int top_k, float top_p, float temp, float repeat_penalty,
                             int repeat_last_n, bool ignore_eos, bool memory_f16,
                             int n_batch, int n_keep, const char** antiprompt, int antiprompt_count,
-                            float tfs_z, float typical_p, float frequency_penalty, float presence_penalty, int mirostat, float mirostat_eta, float mirostat_tau, bool penalize_nl, const char *logit_bias, const char *session_file, bool prompt_cache_all, bool mlock, bool mmap, const char *maingpu, const char *tensorsplit,
+                            float tfs_z, float typical_p, float min_p, float top_n_sigma, float xtc_probability, float xtc_threshold, float dynatemp_range, float dynatemp_exponent, float adaptive_p_target, float adaptive_p_decay, float dry_multiplier, float dry_base, int dry_allowed_length, int dry_penalty_last_n, const char *dry_sequence_breakers, float frequency_penalty, float presence_penalty, int mirostat, float mirostat_eta, float mirostat_tau, bool penalize_nl, const char *logit_bias, const char *session_file, bool prompt_cache_all, bool mlock, bool mmap, const char *maingpu, const char *tensorsplit,
                             bool prompt_cache_ro, const char *grammar, float rope_freq_base, float rope_freq_scale, float negative_prompt_scale, const char* negative_prompt,
                             int n_draft) {
     (void) memory_f16;
     (void) tfs_z;
-    (void) logit_bias;
-    (void) session_file;
-    (void) prompt_cache_all;
     (void) mlock;
     (void) mmap;
     (void) maingpu;
     (void) tensorsplit;
-    (void) prompt_cache_ro;
     (void) rope_freq_base;
     (void) rope_freq_scale;
     (void) negative_prompt_scale;
@@ -369,6 +614,18 @@ void* llama_allocate_params(const char *prompt, int seed, int threads, int token
     params->temp = temp;
     params->repeat_penalty = repeat_penalty;
     params->typical_p = typical_p;
+    params->min_p = min_p;
+    params->top_n_sigma = top_n_sigma;
+    params->xtc_probability = xtc_probability;
+    params->xtc_threshold = xtc_threshold;
+    params->dynatemp_range = dynatemp_range;
+    params->dynatemp_exponent = dynatemp_exponent;
+    params->adaptive_p_target = adaptive_p_target;
+    params->adaptive_p_decay = adaptive_p_decay;
+    params->dry_multiplier = dry_multiplier;
+    params->dry_base = dry_base;
+    params->dry_allowed_length = dry_allowed_length;
+    params->dry_penalty_last_n = dry_penalty_last_n;
     params->frequency_penalty = frequency_penalty;
     params->presence_penalty = presence_penalty;
     params->mirostat = mirostat;
@@ -376,7 +633,15 @@ void* llama_allocate_params(const char *prompt, int seed, int threads, int token
     params->mirostat_tau = mirostat_tau;
     params->ignore_eos = ignore_eos;
     params->penalize_nl = penalize_nl;
+    params->session_file = session_file != nullptr ? session_file : "";
+    params->prompt_cache_all = prompt_cache_all;
+    params->prompt_cache_ro = prompt_cache_ro;
     params->grammar = grammar != nullptr ? grammar : "";
+    params->logit_bias = parse_logit_biases(logit_bias);
+
+    if (dry_sequence_breakers != nullptr && dry_sequence_breakers[0] != '\0') {
+        params->dry_sequence_breakers = split_string(dry_sequence_breakers, '\x1f');
+    }
 
     for (int i = 0; i < antiprompt_count; i++) {
         if (antiprompt != nullptr && antiprompt[i] != nullptr) {
@@ -417,7 +682,7 @@ int llama_embedding_size(void* state_pr) {
     if (state == nullptr || state->model == nullptr) {
         return 0;
     }
-    return llama_model_n_embd(state->model);
+    return llama_model_n_embd_out(state->model);
 }
 
 int get_embeddings(void* params_ptr, void* state_pr, float * res_embeddings) {
@@ -466,7 +731,6 @@ int eval(void* params_ptr, void* state_pr, char *text) {
 }
 
 int llama_predict(void* params_ptr, void* state_pr, char** result, bool debug) {
-    (void) debug;
     llama_binding_params * params = static_cast<llama_binding_params *>(params_ptr);
     llama_binding_state * state = static_cast<llama_binding_state *>(state_pr);
     if (params == nullptr || state == nullptr || state->ctx == nullptr || result == nullptr) {
@@ -483,15 +747,47 @@ int llama_predict(void* params_ptr, void* state_pr, char** result, bool debug) {
         return 1;
     }
 
-    llama_memory_clear(llama_get_memory(state->ctx), true);
+    bool loaded_prompt_cache = false;
+    std::vector<llama_token> cache_tokens;
+    if (!params->session_file.empty() && file_exists(params->session_file)) {
+        cache_tokens.resize(static_cast<size_t>(llama_n_ctx(state->ctx)));
+        size_t cache_count = 0;
+        if (llama_state_load_file(state->ctx, params->session_file.c_str(), cache_tokens.data(), cache_tokens.size(), &cache_count)) {
+            cache_tokens.resize(cache_count);
+            loaded_prompt_cache = cache_tokens == prompt_tokens;
+            if (debug) {
+                fprintf(stderr, "%s: loaded prompt cache %s (%zu tokens, exact=%s)\n",
+                        __func__,
+                        params->session_file.c_str(),
+                        cache_tokens.size(),
+                        loaded_prompt_cache ? "true" : "false");
+            }
+        } else if (debug) {
+            fprintf(stderr, "%s: failed to load prompt cache %s\n", __func__, params->session_file.c_str());
+        }
+    }
+
+    if (!loaded_prompt_cache) {
+        llama_memory_clear(llama_get_memory(state->ctx), true);
+    }
     llama_set_embeddings(state->ctx, false);
     llama_set_n_threads(state->ctx, params->threads, params->threads);
 
-    int batch_size = params->batch > 0 ? params->batch : static_cast<int>(llama_n_batch(state->ctx));
-    int ret = decode_tokens(state->ctx, prompt_tokens, batch_size);
-    if (ret != 0) {
-        fprintf(stderr, "%s: prompt decode failed: %d\n", __func__, ret);
-        return ret;
+    std::vector<llama_token> session_tokens = prompt_tokens;
+    int ret = 0;
+    if (!loaded_prompt_cache) {
+        int batch_size = params->batch > 0 ? params->batch : static_cast<int>(llama_n_batch(state->ctx));
+        ret = decode_tokens(state->ctx, prompt_tokens, batch_size);
+        if (ret != 0) {
+            fprintf(stderr, "%s: prompt decode failed: %d\n", __func__, ret);
+            return ret;
+        }
+
+        if (!params->session_file.empty() && !params->prompt_cache_ro && !params->prompt_cache_all) {
+            if (!llama_state_save_file(state->ctx, params->session_file.c_str(), session_tokens.data(), session_tokens.size()) && debug) {
+                fprintf(stderr, "%s: failed to save prompt cache %s\n", __func__, params->session_file.c_str());
+            }
+        }
     }
 
     llama_sampler * sampler = create_sampler(state, params);
@@ -509,6 +805,7 @@ int llama_predict(void* params_ptr, void* state_pr, char** result, bool debug) {
 
         std::string piece = token_to_piece(state->vocab, token);
         output += piece;
+        session_tokens.push_back(token);
 
         if (!tokenCallback(state, const_cast<char *>(piece.c_str()))) {
             break;
@@ -528,6 +825,15 @@ int llama_predict(void* params_ptr, void* state_pr, char** result, bool debug) {
     }
 
     llama_sampler_free(sampler);
+    if (!params->session_file.empty() && !params->prompt_cache_ro && params->prompt_cache_all) {
+        if (!llama_state_save_file(state->ctx, params->session_file.c_str(), session_tokens.data(), session_tokens.size()) && debug) {
+            fprintf(stderr, "%s: failed to save final prompt cache %s\n", __func__, params->session_file.c_str());
+        }
+    }
+    if (debug) {
+        llama_perf_context_print(state->ctx);
+        llama_perf_context_reset(state->ctx);
+    }
     return copy_result_string(output, result);
 }
 
@@ -560,6 +866,33 @@ int llama_tokenize_string(void* params_ptr, void* state_pr, int* result) {
         result[i] = tokens[static_cast<size_t>(i)];
     }
     return actual;
+}
+
+int llama_detokenize_tokens(void* state_pr, const int* tokens, int token_count, bool remove_special, bool unparse_special, char** result) {
+    llama_binding_state * state = static_cast<llama_binding_state *>(state_pr);
+    if (state == nullptr || state->vocab == nullptr || result == nullptr || token_count < 0) {
+        return 1;
+    }
+    if (token_count == 0) {
+        return copy_result_string("", result);
+    }
+
+    std::vector<llama_token> token_vec(static_cast<size_t>(token_count));
+    for (int i = 0; i < token_count; i++) {
+        token_vec[static_cast<size_t>(i)] = static_cast<llama_token>(tokens[i]);
+    }
+
+    int needed = -llama_detokenize(state->vocab, token_vec.data(), token_count, nullptr, 0, remove_special, unparse_special);
+    if (needed < 0) {
+        return 1;
+    }
+
+    std::vector<char> buffer(static_cast<size_t>(needed) + 1);
+    int actual = llama_detokenize(state->vocab, token_vec.data(), token_count, buffer.data(), static_cast<int32_t>(buffer.size()), remove_special, unparse_special);
+    if (actual < 0) {
+        return 1;
+    }
+    return copy_result_string(std::string(buffer.data(), static_cast<size_t>(actual)), result);
 }
 
 int save_state(void *state_pr, char *dst, char *modes) {
@@ -643,4 +976,104 @@ int llama_apply_chat_template(void* state_pr, const char** roles, const char** c
     }
 
     return copy_result_string(std::string(buffer.data(), static_cast<size_t>(actual)), result);
+}
+
+int llama_model_info_json(void* state_pr, char** result) {
+    llama_binding_state * state = static_cast<llama_binding_state *>(state_pr);
+    if (state == nullptr || state->model == nullptr || state->vocab == nullptr || result == nullptr) {
+        return 1;
+    }
+
+    llama_model * model = state->model;
+    const llama_vocab * vocab = state->vocab;
+
+    char desc[1024];
+    int desc_len = llama_model_desc(model, desc, sizeof(desc));
+    std::string description = desc_len > 0 ? std::string(desc, static_cast<size_t>(std::min<int>(desc_len, sizeof(desc) - 1))) : "";
+
+    enum llama_ftype ftype = llama_model_ftype(model);
+    const char * ftype_name = llama_ftype_name(ftype);
+    const char * chat_template = llama_model_chat_template(model, nullptr);
+
+    std::string json = "{";
+    append_json_string_field(json, "description", description, false);
+    json += ",\"size\":" + std::to_string(llama_model_size(model));
+    json += ",\"parameters\":" + std::to_string(llama_model_n_params(model));
+    json += ",\"ftype\":" + std::to_string(static_cast<int>(ftype));
+    append_json_string_field(json, "ftype_name", ftype_name != nullptr ? ftype_name : "");
+    json += ",\"context_train\":" + std::to_string(llama_model_n_ctx_train(model));
+    json += ",\"embedding_length\":" + std::to_string(llama_model_n_embd(model));
+    json += ",\"embedding_input_length\":" + std::to_string(llama_model_n_embd_inp(model));
+    json += ",\"embedding_output_length\":" + std::to_string(llama_model_n_embd_out(model));
+    json += ",\"layers\":" + std::to_string(llama_model_n_layer(model));
+    json += ",\"heads\":" + std::to_string(llama_model_n_head(model));
+    json += ",\"heads_kv\":" + std::to_string(llama_model_n_head_kv(model));
+    json += ",\"vocab_size\":" + std::to_string(llama_vocab_n_tokens(vocab));
+    json += ",\"rope_type\":" + std::to_string(static_cast<int>(llama_model_rope_type(model)));
+    json += ",\"has_encoder\":" + std::string(llama_model_has_encoder(model) ? "true" : "false");
+    json += ",\"has_decoder\":" + std::string(llama_model_has_decoder(model) ? "true" : "false");
+    json += ",\"is_recurrent\":" + std::string(llama_model_is_recurrent(model) ? "true" : "false");
+    json += ",\"is_hybrid\":" + std::string(llama_model_is_hybrid(model) ? "true" : "false");
+    json += ",\"is_diffusion\":" + std::string(llama_model_is_diffusion(model) ? "true" : "false");
+    append_json_string_field(json, "chat_template", chat_template != nullptr ? chat_template : "");
+    json += ",\"metadata\":{";
+
+    const int meta_count = llama_model_meta_count(model);
+    bool first_meta = true;
+    for (int i = 0; i < meta_count; i++) {
+        char key_buf[512];
+        char val_buf[4096];
+        int key_len = llama_model_meta_key_by_index(model, i, key_buf, sizeof(key_buf));
+        int val_len = llama_model_meta_val_str_by_index(model, i, val_buf, sizeof(val_buf));
+        if (key_len < 0 || val_len < 0) {
+            continue;
+        }
+
+        std::string key(key_buf, static_cast<size_t>(std::min<int>(key_len, sizeof(key_buf) - 1)));
+        std::string val(val_buf, static_cast<size_t>(std::min<int>(val_len, sizeof(val_buf) - 1)));
+        if (!first_meta) {
+            json += ",";
+        }
+        first_meta = false;
+        json += "\"";
+        json += json_escape(key);
+        json += "\":\"";
+        json += json_escape(val);
+        json += "\"";
+    }
+
+    json += "}}";
+    return copy_result_string(json, result);
+}
+
+int llama_builtin_chat_templates_json(char** result) {
+    if (result == nullptr) {
+        return 1;
+    }
+
+    int count = llama_chat_builtin_templates(nullptr, 0);
+    if (count < 0) {
+        return 1;
+    }
+    if (count == 0) {
+        return copy_result_string("[]", result);
+    }
+
+    std::vector<const char *> templates(static_cast<size_t>(count));
+    int actual = llama_chat_builtin_templates(templates.data(), templates.size());
+    if (actual < 0) {
+        return 1;
+    }
+
+    std::string json = "[";
+    for (int i = 0; i < actual; i++) {
+        if (i > 0) {
+            json += ",";
+        }
+        json += "\"";
+        json += json_escape(templates[static_cast<size_t>(i)] != nullptr ? templates[static_cast<size_t>(i)] : "");
+        json += "\"";
+    }
+    json += "]";
+    return copy_result_string(json, result);
 }

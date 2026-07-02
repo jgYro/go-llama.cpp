@@ -101,6 +101,36 @@ must point at a local Granite GGUF file or an Ollama blob containing that GGUF:
 TEST_GRANITE_MODEL=/path/to/granite.gguf go test -run TestGraniteChatTemplateAndPredict -v
 ```
 
+## Binding feature support
+
+This fork targets the modern public `llama.cpp` C API and exposes the core
+local-library path from Go:
+
+- GGUF model loading, Metal/Accelerate on macOS, and configurable GPU layers.
+- Context options for context size, batch/micro-batch size, max sequences,
+  RoPE scaling, pooling type, attention type, and flash attention mode.
+- Text generation with top-k, top-p, min-p, typical-p, top-n-sigma, XTC,
+  dynamic temperature, greedy, Mirostat v1/v2, DRY, repetition/frequency/
+  presence penalties, EOG suppression, GBNF grammar constraints, stop strings,
+  token callbacks, and token-id logit bias.
+- Prompt cache files through modern `llama_state_load_file` /
+  `llama_state_save_file`.
+- Embeddings, token embeddings, tokenization, detokenization, chat-template
+  application, built-in chat-template listing, state save/load, and model
+  metadata introspection.
+- Single LoRA adapter loading at model initialization.
+
+Known gaps compared with the full `llama.cpp` project:
+
+- `llama-server` is not embedded here, so OpenAI/Anthropic HTTP routes,
+  streaming SSE, slots, metrics, model routing, Web UI, MCP/tools, and server
+  request parsing are out of scope for this library wrapper.
+- `SpeculativeSampling` is still API-compatible but currently falls back to
+  normal prediction; true draft-model speculation needs a separate pass.
+- Multimodal image/audio/video, runtime LoRA adapter management, reranking
+  endpoints, JSON-schema-to-grammar conversion, tool-call parsing, and
+  continuous batching are not yet exposed as Go APIs.
+
 ## Acceleration
 
 ### OpenBLAS
