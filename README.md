@@ -41,6 +41,40 @@ Now you can run the example with:
 LIBRARY_PATH=$PWD C_INCLUDE_PATH=$PWD go run ./examples -m "/model/path/here" -t 14
 ```
 
+## Maintaining this fork
+
+This fork uses `origin` for the fork and `upstream` for the original project:
+
+```bash
+origin   https://github.com/jgYro/go-llama.cpp.git
+upstream https://github.com/go-skynet/go-llama.cpp
+```
+
+To update this fork from upstream:
+
+```bash
+git switch master
+git fetch upstream
+git merge upstream/master
+go test ./...
+git push origin master
+```
+
+To add future local changes:
+
+```bash
+git switch master
+go test ./...
+git add <files>
+git commit -m "Describe the change"
+git push origin master
+```
+
+After builds, the `llama.cpp` submodule may show local modifications because
+the Makefile applies this project's compatibility patch inside the submodule.
+If an upstream update changes the submodule pointer, review and clean/update
+the submodule deliberately rather than forcing over those changes.
+
 ## Acceleration
 
 ### OpenBLAS
