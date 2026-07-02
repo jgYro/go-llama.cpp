@@ -1,9 +1,9 @@
 package llama
 
-// #cgo CXXFLAGS: -I${SRCDIR}/llama.cpp/common -I${SRCDIR}/llama.cpp
-// #cgo LDFLAGS: -L${SRCDIR}/ -lbinding -lm -lstdc++
-// #cgo darwin LDFLAGS: -framework Accelerate -framework Foundation -framework Metal -framework MetalKit -framework MetalPerformanceShaders
-// #cgo darwin CXXFLAGS: -std=c++11
+// #cgo CXXFLAGS: -I${SRCDIR}/llama.cpp/include -I${SRCDIR}/llama.cpp/ggml/include -I${SRCDIR}/llama.cpp/ggml/src -std=c++17
+// #cgo LDFLAGS: -L${SRCDIR}/ -lbinding -lm
+// #cgo linux LDFLAGS: -lstdc++
+// #cgo darwin LDFLAGS: -lc++ -framework Accelerate -framework Foundation -framework Metal -framework MetalKit -framework MetalPerformanceShaders
 // #include "binding.h"
 // #include <stdlib.h>
 import "C"
@@ -18,6 +18,11 @@ type LLama struct {
 	state       unsafe.Pointer
 	embeddings  bool
 	contextSize int
+}
+
+type ChatMessage struct {
+	Role    string
+	Content string
 }
 
 type cPredictParams struct {
@@ -286,6 +291,47 @@ func (l *LLama) Predict(text string, opts ...PredictOption) (string, error) {
 	defer C.free(unsafe.Pointer(out))
 
 	return cleanPredictionResult(C.GoString(out), text, po.StopPrompts), nil
+}
+
+func (l *LLama) ApplyChatTemplate(messages []ChatMessage, addGenerationPrompt bool) (string, error) {
+	if l.state == nil {
+		return "", fmt.Errorf("model is not loaded")
+	}
+	if len(messages) == 0 {
+		return "", nil
+	}
+
+	roles := make([]*C.char, len(messages))
+	contents := make([]*C.char, len(messages))
+	for i, message := range messages {
+		roles[i] = C.CString(message.Role)
+		contents[i] = C.CString(message.Content)
+	}
+	defer func() {
+		for i := range messages {
+			C.free(unsafe.Pointer(roles[i]))
+			C.free(unsafe.Pointer(contents[i]))
+		}
+	}()
+
+	var out *C.char
+	ret := C.llama_apply_chat_template(
+		l.state,
+		(**C.char)(unsafe.Pointer(&roles[0])),
+		(**C.char)(unsafe.Pointer(&contents[0])),
+		C.int(len(messages)),
+		C.bool(addGenerationPrompt),
+		&out,
+	)
+	if ret != 0 {
+		return "", fmt.Errorf("chat template formatting failed")
+	}
+	if out == nil {
+		return "", fmt.Errorf("chat template formatting returned no output")
+	}
+	defer C.free(unsafe.Pointer(out))
+
+	return C.GoString(out), nil
 }
 
 func cleanPredictionResult(res, prompt string, stopPrompts []string) string {

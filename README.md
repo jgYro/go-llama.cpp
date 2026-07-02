@@ -1,6 +1,6 @@
 # [![Go Reference](https://pkg.go.dev/badge/github.com/go-skynet/go-llama.cpp.svg)](https://pkg.go.dev/github.com/go-skynet/go-llama.cpp) go-llama.cpp
 
-[LLama.cpp](https://github.com/ggerganov/llama.cpp) golang bindings.
+[LLama.cpp](https://github.com/ggml-org/llama.cpp) golang bindings.
 
 The go-llama.cpp bindings are high level, as such most of the work is kept into the C/C++ code to avoid any extra computational cost, be more performant and lastly ease out maintenance, while keeping the usage as simple as possible.
 
@@ -10,18 +10,18 @@ If you are looking for an high-level OpenAI compatible API, check out [here](htt
 
 ## Attention!
 
-Since https://github.com/go-skynet/go-llama.cpp/pull/180 is merged, now go-llama.cpp is not anymore compatible with `ggml` format, but it works ONLY with the new `gguf` file format. See also the upstream PR: https://github.com/ggerganov/llama.cpp/pull/2398.
+Since https://github.com/go-skynet/go-llama.cpp/pull/180 is merged, now go-llama.cpp is not anymore compatible with `ggml` format, but it works ONLY with the new `gguf` file format. See also the upstream PR: https://github.com/ggml-org/llama.cpp/pull/2398.
 
 If you need to use the `ggml` format, use the https://github.com/go-skynet/go-llama.cpp/releases/tag/pre-gguf tag.
 
 ## Usage
 
-Note: This repository uses git submodules to keep track of [LLama.cpp](https://github.com/ggerganov/llama.cpp).
+Note: This repository uses git submodules to keep track of [LLama.cpp](https://github.com/ggml-org/llama.cpp).
 
 Clone the repository locally:
 
 ```bash
-git clone --recurse-submodules https://github.com/go-skynet/go-llama.cpp
+git clone --recurse-submodules https://github.com/jgYro/go-llama.cpp
 ```
 
 To build the bindings locally, run:
@@ -30,6 +30,10 @@ To build the bindings locally, run:
 cd go-llama.cpp
 make libbinding.a
 ```
+
+The Makefile builds the `llama.cpp` submodule with CMake, then combines the
+static `llama.cpp` and `ggml` libraries with this project's `binding.cpp` into
+`libbinding.a`.
 
 On macOS, the Go bindings include the Darwin framework link flags needed by
 the default Accelerate/Metal `llama.cpp` build, so plain `go test ./...` and
@@ -60,6 +64,19 @@ go test ./...
 git push origin master
 ```
 
+To update the bundled `llama.cpp` version:
+
+```bash
+git -C llama.cpp fetch --tags origin
+git -C llama.cpp checkout <tag-or-commit>
+make clean
+make libbinding.a
+go test ./...
+git add .gitmodules llama.cpp Makefile binding.cpp binding.h llama.go options.go
+git commit -m "Update llama.cpp"
+git push origin master
+```
+
 To add future local changes:
 
 ```bash
@@ -70,10 +87,19 @@ git commit -m "Describe the change"
 git push origin master
 ```
 
-After builds, the `llama.cpp` submodule may show local modifications because
-the Makefile applies this project's compatibility patch inside the submodule.
-If an upstream update changes the submodule pointer, review and clean/update
-the submodule deliberately rather than forcing over those changes.
+The Makefile does not patch the submodule in place. If an upstream
+`llama.cpp` update changes public APIs, port the C++ binding first, then move
+the submodule pointer and test the Go package.
+
+## Granite / Ollama checks
+
+This fork includes a Granite integration test that applies the model's native
+chat template and verifies a JSON-only prompt/response path. `TEST_GRANITE_MODEL`
+must point at a local Granite GGUF file or an Ollama blob containing that GGUF:
+
+```bash
+TEST_GRANITE_MODEL=/path/to/granite.gguf go test -run TestGraniteChatTemplateAndPredict -v
+```
 
 ## Acceleration
 
@@ -125,10 +151,10 @@ ggml_opencl: device FP16 support: true
 ### Metal (Apple Silicon)
 
 ```
+make clean
 BUILD_TYPE=metal make libbinding.a
-LIBRARY_PATH=$PWD C_INCLUDE_PATH=$PWD go build ./examples/main.go
-cp build/bin/ggml-metal.metal .
-./main -m "/model/path/here" -t 1 -ngl 1
+go test ./...
+LIBRARY_PATH=$PWD C_INCLUDE_PATH=$PWD go run ./examples -m "/model/path/here" -t 1 -ngl 1
 ```
 
 Enjoy!

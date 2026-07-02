@@ -70,8 +70,8 @@ var DefaultModelOptions ModelOptions = ModelOptions{
 	MMap:          true,
 	LowVRAM:       false,
 	NBatch:        512,
-	FreqRopeBase:  10000,
-	FreqRopeScale: 1.0,
+	FreqRopeBase:  0,
+	FreqRopeScale: 0,
 }
 
 var DefaultOptions PredictOptions = PredictOptions{
@@ -93,8 +93,8 @@ var DefaultOptions PredictOptions = PredictOptions{
 	MirostatTAU:       5.0,
 	MirostatETA:       0.1,
 	MMap:              true,
-	RopeFreqBase:      10000,
-	RopeFreqScale:     1.0,
+	RopeFreqBase:      0,
+	RopeFreqScale:     0,
 }
 
 func SetMulMatQ(b bool) ModelOption {

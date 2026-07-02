@@ -56,10 +56,8 @@ int llama_tokenize_string(void* params_ptr, void* state_pr, int* result);
 
 int llama_predict(void* params_ptr, void* state_pr, char** result, bool debug);
 
+int llama_apply_chat_template(void* state_pr, const char** roles, const char** contents, int count, bool add_generation_prompt, char** result);
+
 #ifdef __cplusplus
 }
-
-
-std::vector<std::string> create_vector(const char** strings, int count);
-void delete_vector(std::vector<std::string>* vec);
 #endif
