@@ -101,6 +101,35 @@ must point at a local Granite GGUF file or an Ollama blob containing that GGUF:
 TEST_GRANITE_MODEL=/path/to/granite.gguf go test -run TestGraniteChatTemplateAndPredict -v
 ```
 
+The `toolchat` package adds a local Go tool-calling loop on top of the
+llama.cpp binding. It uses chat templates, grammar-constrained JSON envelopes,
+OpenAI-shaped tool definitions, Go callbacks for tool execution, and tool-result
+turns fed back into the model:
+
+```go
+runner := toolchat.Runner{
+    Model: model,
+    Tools: []toolchat.Tool{{
+        Name:        "get_weather",
+        Description: "Return weather for a city.",
+        Schema:      json.RawMessage(`{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}`),
+        Call: func(ctx context.Context, args json.RawMessage) (any, error) {
+            return map[string]any{"city": "Boston", "temperature_f": 72}, nil
+        },
+    }},
+}
+
+resp, err := runner.Generate(ctx, []llama.ChatMessage{
+    {Role: "user", Content: "Use get_weather for Boston, then answer."},
+})
+```
+
+To run the Granite end-to-end tool-loop check:
+
+```bash
+TEST_GRANITE_MODEL=/path/to/granite.gguf go test ./toolchat -run TestGraniteToolRunner -v
+```
+
 ## Binding feature support
 
 This fork targets the modern public `llama.cpp` C API and exposes the core
@@ -119,6 +148,9 @@ local-library path from Go:
   application, built-in chat-template listing, state save/load, and model
   metadata introspection.
 - Single LoRA adapter loading at model initialization.
+- Go-native tool calling via `toolchat`: JSON envelope prompting, GBNF grammar
+  constraints, OpenAI-shaped tool descriptors, tool execution callbacks,
+  tool-result turns, and parsing for local JSON/OpenAI-style tool-call payloads.
 
 Known gaps compared with the full `llama.cpp` project:
 
@@ -128,8 +160,9 @@ Known gaps compared with the full `llama.cpp` project:
 - `SpeculativeSampling` is still API-compatible but currently falls back to
   normal prediction; true draft-model speculation needs a separate pass.
 - Multimodal image/audio/video, runtime LoRA adapter management, reranking
-  endpoints, JSON-schema-to-grammar conversion, tool-call parsing, and
-  continuous batching are not yet exposed as Go APIs.
+  endpoints, model-native `common_chat` tool template parsing, full
+  JSON-schema-to-grammar conversion, and continuous batching are not yet
+  exposed as Go APIs.
 
 ## Acceleration
 

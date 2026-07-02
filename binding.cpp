@@ -337,7 +337,8 @@ static int decode_tokens(llama_context * ctx, std::vector<llama_token> & tokens,
     }
 
     int offset = 0;
-    const int limit = std::max(1, batch_size);
+    const int ctx_batch = std::max(1, static_cast<int>(llama_n_batch(ctx)));
+    const int limit = std::max(1, std::min(batch_size, ctx_batch));
     while (offset < static_cast<int>(tokens.size())) {
         const int n = std::min(limit, static_cast<int>(tokens.size()) - offset);
         llama_batch batch = llama_batch_get_one(tokens.data() + offset, n);
