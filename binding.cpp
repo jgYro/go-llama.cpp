@@ -103,6 +103,18 @@ static int copy_result_string(const std::string & src, char ** result) {
     return 0;
 }
 
+// Copies a human-readable failure reason into *error_out (malloc'd, freed by
+// the Go side) so callers get the cause instead of a bare failure code.
+static void set_binding_error(char ** error_out, const std::string & message) {
+    if (error_out == nullptr) {
+        return;
+    }
+    *error_out = static_cast<char *>(malloc(message.size() + 1));
+    if (*error_out != nullptr) {
+        memcpy(*error_out, message.c_str(), message.size() + 1);
+    }
+}
+
 static std::string trim_copy(const std::string & value) {
     size_t begin = 0;
     while (begin < value.size() && std::isspace(static_cast<unsigned char>(value[begin]))) {
@@ -382,7 +394,7 @@ static int decode_tokens(llama_context * ctx, llama_token * tokens, int count, i
     return 0;
 }
 
-static llama_sampler * create_sampler(llama_binding_state * state, const llama_binding_params * params) {
+static llama_sampler * create_sampler(llama_binding_state * state, const llama_binding_params * params, char ** error_out) {
     llama_sampler_chain_params chain_params = llama_sampler_chain_default_params();
     llama_sampler * sampler = llama_sampler_chain_init(chain_params);
 
@@ -403,6 +415,7 @@ static llama_sampler * create_sampler(llama_binding_state * state, const llama_b
     if (!params->grammar.empty()) {
         llama_sampler * grammar = llama_sampler_init_grammar(state->vocab, params->grammar.c_str(), "root");
         if (grammar == nullptr) {
+            set_binding_error(error_out, "failed to parse GBNF grammar");
             fprintf(stderr, "%s: error: failed to parse grammar\n", __func__);
             llama_sampler_free(sampler);
             return nullptr;
@@ -470,8 +483,9 @@ static llama_sampler * create_sampler(llama_binding_state * state, const llama_b
     return sampler;
 }
 
-static int embedding_for_tokens(llama_binding_state * state, std::vector<llama_token> & tokens, llama_binding_params * params, float * res_embeddings) {
+static int embedding_for_tokens(llama_binding_state * state, std::vector<llama_token> & tokens, llama_binding_params * params, float * res_embeddings, char ** error_out) {
     if (state == nullptr || state->ctx == nullptr || state->model == nullptr || res_embeddings == nullptr) {
+        set_binding_error(error_out, "embeddings called without a loaded model");
         return 1;
     }
 
@@ -485,6 +499,7 @@ static int embedding_for_tokens(llama_binding_state * state, std::vector<llama_t
 
     int ret = decode_tokens(state->ctx, tokens.data(), static_cast<int>(tokens.size()), params->batch > 0 ? params->batch : static_cast<int>(llama_n_batch(state->ctx)));
     if (ret != 0) {
+        set_binding_error(error_out, "embedding decode failed with code " + std::to_string(ret));
         return ret;
     }
 
@@ -497,6 +512,7 @@ static int embedding_for_tokens(llama_binding_state * state, std::vector<llama_t
         embeddings = llama_get_embeddings(state->ctx);
     }
     if (embeddings == nullptr) {
+        set_binding_error(error_out, "model returned no embeddings; was it loaded with embeddings enabled?");
         return 1;
     }
 
@@ -531,7 +547,8 @@ void* load_model(const char *fname,
                  bool mul_mat_q,
                  const char *lora,
                  const char *lora_base,
-                 bool perplexity) {
+                 bool perplexity,
+                 char **error_out) {
     (void) n_seed;
     (void) memory_f16;
     (void) low_vram;
@@ -548,7 +565,7 @@ void* load_model(const char *fname,
 
     std::vector<float> tensor_split;
     if (!parse_tensor_split(tensorsplit, tensor_split)) {
-        fprintf(stderr, "%s: error: invalid tensor split \"%s\"\n", __func__, tensorsplit);
+        set_binding_error(error_out, std::string("invalid tensor split \"") + tensorsplit + "\" (expected comma-separated numbers)");
         return nullptr;
     }
     if (!tensor_split.empty()) {
@@ -558,7 +575,7 @@ void* load_model(const char *fname,
     if (maingpu != nullptr && maingpu[0] != '\0') {
         int main_gpu = 0;
         if (!parse_main_gpu(maingpu, main_gpu)) {
-            fprintf(stderr, "%s: error: invalid main GPU \"%s\" (expected a device index)\n", __func__, maingpu);
+            set_binding_error(error_out, std::string("invalid main GPU \"") + maingpu + "\" (expected a device index)");
             return nullptr;
         }
         model_params.main_gpu = main_gpu;
@@ -566,7 +583,7 @@ void* load_model(const char *fname,
 
     llama_model * model = llama_model_load_from_file(fname, model_params);
     if (model == nullptr) {
-        fprintf(stderr, "%s: error: unable to load model %s\n", __func__, fname);
+        set_binding_error(error_out, std::string("unable to load model ") + fname);
         return nullptr;
     }
 
@@ -596,7 +613,7 @@ void* load_model(const char *fname,
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
     if (ctx == nullptr) {
-        fprintf(stderr, "%s: error: failed to create context for %s\n", __func__, fname);
+        set_binding_error(error_out, std::string("failed to create context for ") + fname);
         llama_model_free(model);
         return nullptr;
     }
@@ -610,14 +627,14 @@ void* load_model(const char *fname,
     if (lora != nullptr && lora[0] != '\0') {
         llama_adapter_lora * adapter = llama_adapter_lora_init(model, lora);
         if (adapter == nullptr) {
-            fprintf(stderr, "%s: error: failed to load LoRA adapter %s\n", __func__, lora);
+            set_binding_error(error_out, std::string("failed to load LoRA adapter ") + lora);
             llama_binding_free_model(state);
             return nullptr;
         }
         state->adapters.push_back(adapter);
         std::vector<float> scales(state->adapters.size(), 1.0f);
         if (llama_set_adapters_lora(ctx, state->adapters.data(), state->adapters.size(), scales.data()) != 0) {
-            fprintf(stderr, "%s: error: failed to apply LoRA adapter %s\n", __func__, lora);
+            set_binding_error(error_out, std::string("failed to apply LoRA adapter ") + lora);
             llama_binding_free_model(state);
             return nullptr;
         }
@@ -729,21 +746,23 @@ int llama_embedding_size(void* state_pr) {
     return llama_model_n_embd_out(state->model);
 }
 
-int get_embeddings(void* params_ptr, void* state_pr, float * res_embeddings) {
+int get_embeddings(void* params_ptr, void* state_pr, float * res_embeddings, char** error_out) {
     llama_binding_params * params = static_cast<llama_binding_params *>(params_ptr);
     llama_binding_state * state = static_cast<llama_binding_state *>(state_pr);
     if (params == nullptr || state == nullptr) {
+        set_binding_error(error_out, "embeddings called without a loaded model");
         return 1;
     }
 
     std::vector<llama_token> tokens = tokenize_text(state->vocab, params->prompt, true);
-    return embedding_for_tokens(state, tokens, params, res_embeddings);
+    return embedding_for_tokens(state, tokens, params, res_embeddings, error_out);
 }
 
-int get_token_embeddings(void* params_ptr, void* state_pr, int *tokens, int tokenSize, float * res_embeddings) {
+int get_token_embeddings(void* params_ptr, void* state_pr, int *tokens, int tokenSize, float * res_embeddings, char** error_out) {
     llama_binding_params * params = static_cast<llama_binding_params *>(params_ptr);
     llama_binding_state * state = static_cast<llama_binding_state *>(state_pr);
     if (params == nullptr || state == nullptr || tokenSize < 0) {
+        set_binding_error(error_out, "token embeddings called without a loaded model or with a negative token count");
         return 1;
     }
 
@@ -753,13 +772,14 @@ int get_token_embeddings(void* params_ptr, void* state_pr, int *tokens, int toke
         token_vec.push_back(static_cast<llama_token>(tokens[i]));
     }
 
-    return embedding_for_tokens(state, token_vec, params, res_embeddings);
+    return embedding_for_tokens(state, token_vec, params, res_embeddings, error_out);
 }
 
-int eval(void* params_ptr, void* state_pr, char *text) {
+int eval(void* params_ptr, void* state_pr, char *text, char** error_out) {
     llama_binding_params * params = static_cast<llama_binding_params *>(params_ptr);
     llama_binding_state * state = static_cast<llama_binding_state *>(state_pr);
     if (params == nullptr || state == nullptr || state->ctx == nullptr) {
+        set_binding_error(error_out, "eval called without a loaded model");
         return 1;
     }
 
@@ -771,13 +791,18 @@ int eval(void* params_ptr, void* state_pr, char *text) {
 
     llama_memory_clear(llama_get_memory(state->ctx), true);
     llama_set_n_threads(state->ctx, params->threads, params->threads);
-    return decode_tokens(state->ctx, tokens.data(), static_cast<int>(tokens.size()), params->batch > 0 ? params->batch : static_cast<int>(llama_n_batch(state->ctx)));
+    int ret = decode_tokens(state->ctx, tokens.data(), static_cast<int>(tokens.size()), params->batch > 0 ? params->batch : static_cast<int>(llama_n_batch(state->ctx)));
+    if (ret != 0) {
+        set_binding_error(error_out, "eval decode failed with code " + std::to_string(ret));
+    }
+    return ret;
 }
 
-int llama_predict(void* params_ptr, void* state_pr, char** result, bool debug) {
+int llama_predict(void* params_ptr, void* state_pr, char** result, bool debug, char** error_out) {
     llama_binding_params * params = static_cast<llama_binding_params *>(params_ptr);
     llama_binding_state * state = static_cast<llama_binding_state *>(state_pr);
     if (params == nullptr || state == nullptr || state->ctx == nullptr || result == nullptr) {
+        set_binding_error(error_out, "prediction called without a loaded model");
         return 1;
     }
 
@@ -788,7 +813,7 @@ int llama_predict(void* params_ptr, void* state_pr, char** result, bool debug) {
 
     const int n_ctx = static_cast<int>(llama_n_ctx(state->ctx));
     if (static_cast<int>(prompt_tokens.size()) >= n_ctx) {
-        fprintf(stderr, "%s: prompt is too long (%zu tokens, context %d)\n", __func__, prompt_tokens.size(), n_ctx);
+        set_binding_error(error_out, "prompt is too long (" + std::to_string(prompt_tokens.size()) + " tokens, context " + std::to_string(n_ctx) + ")");
         return 1;
     }
 
@@ -844,7 +869,7 @@ int llama_predict(void* params_ptr, void* state_pr, char** result, bool debug) {
         int batch_size = params->batch > 0 ? params->batch : static_cast<int>(llama_n_batch(state->ctx));
         ret = decode_tokens(state->ctx, prompt_tokens.data() + n_reused, static_cast<int>(prompt_tokens.size() - n_reused), batch_size);
         if (ret != 0) {
-            fprintf(stderr, "%s: prompt decode failed: %d\n", __func__, ret);
+            set_binding_error(error_out, "prompt decode failed with code " + std::to_string(ret));
             return ret;
         }
 
@@ -855,7 +880,7 @@ int llama_predict(void* params_ptr, void* state_pr, char** result, bool debug) {
         }
     }
 
-    llama_sampler * sampler = create_sampler(state, params);
+    llama_sampler * sampler = create_sampler(state, params, error_out);
     if (sampler == nullptr) {
         return 1;
     }
@@ -901,7 +926,7 @@ int llama_predict(void* params_ptr, void* state_pr, char** result, bool debug) {
         llama_batch batch = llama_batch_get_one(&token, 1);
         ret = llama_decode(state->ctx, batch);
         if (ret != 0) {
-            fprintf(stderr, "%s: token decode failed: %d\n", __func__, ret);
+            set_binding_error(error_out, "token decode failed with code " + std::to_string(ret));
             llama_sampler_free(sampler);
             return ret;
         }
@@ -924,10 +949,10 @@ int llama_predict(void* params_ptr, void* state_pr, char** result, bool debug) {
     return copy_result_string(output, result);
 }
 
-int speculative_sampling(void* params_ptr, void* target_model, void* draft_model, char** result, bool debug) {
+int speculative_sampling(void* params_ptr, void* target_model, void* draft_model, char** result, bool debug, char** error_out) {
     (void) draft_model;
     fprintf(stderr, "%s: warning: speculative decoding is not implemented in this binding; the draft model is unused and generation falls back to standard prediction\n", __func__);
-    return llama_predict(params_ptr, target_model, result, debug);
+    return llama_predict(params_ptr, target_model, result, debug, error_out);
 }
 
 int llama_tokenize_string(void* params_ptr, void* state_pr, int* result) {

@@ -9,6 +9,7 @@ package llama
 import "C"
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -16,10 +17,28 @@ import (
 	"unsafe"
 )
 
+// LLama wraps a single model plus inference context. All methods are safe for
+// concurrent use: operations that mutate the context (Predict, Eval,
+// Embeddings, state save/load, ...) are serialized on an internal mutex, so
+// concurrent calls on one instance queue rather than race. For parallel
+// inference, load multiple instances (see Pool).
 type LLama struct {
+	mu          sync.Mutex
 	state       unsafe.Pointer
 	embeddings  bool
 	contextSize int
+}
+
+// bindingError converts a C-side error message into a Go error and frees it.
+// Falls back to the given generic message when the binding did not set one.
+func bindingError(cmsg *C.char, fallback string) error {
+	if cmsg != nil {
+		defer C.free(unsafe.Pointer(cmsg))
+		if msg := C.GoString(cmsg); msg != "" {
+			return errors.New(msg)
+		}
+	}
+	return errors.New(fallback)
 }
 
 type ChatMessage struct {
@@ -140,6 +159,7 @@ func New(model string, opts ...ModelOption) (*LLama, error) {
 		MulMatQ = *mo.MulMatQ
 	}
 
+	var cerr *C.char
 	result := C.load_model(modelPath,
 		C.int(mo.ContextSize), C.int(mo.Seed),
 		C.bool(mo.F16Memory), C.bool(mo.MLock), C.bool(mo.Embeddings), C.bool(mo.MMap), C.bool(mo.LowVRAM),
@@ -147,10 +167,11 @@ func New(model string, opts ...ModelOption) (*LLama, error) {
 		C.float(mo.FreqRopeBase), C.float(mo.FreqRopeScale),
 		C.int(mo.RopeScaling), C.int(mo.Pooling), C.int(mo.Attention), C.int(mo.FlashAttention), C.int(mo.NUBatch), C.int(mo.NSeqMax),
 		C.bool(MulMatQ), loraAdapter, loraBase, C.bool(mo.Perplexity),
+		&cerr,
 	)
 
 	if result == nil {
-		return nil, fmt.Errorf("failed loading model")
+		return nil, fmt.Errorf("failed loading model: %w", bindingError(cerr, "unknown cause"))
 	}
 
 	ll := &LLama{state: result, contextSize: mo.ContextSize, embeddings: mo.Embeddings}
@@ -176,6 +197,9 @@ func BuiltinChatTemplates() ([]string, error) {
 }
 
 func (l *LLama) Free() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	if l.state == nil {
 		return
 	}
@@ -190,6 +214,9 @@ func (l *LLama) LoadState(state string) error {
 	defer C.free(unsafe.Pointer(d)) // free allocated C string
 	defer C.free(unsafe.Pointer(w)) // free allocated C string
 
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	result := C.load_state(l.state, d, w)
 	if result != 0 {
 		return fmt.Errorf("error while loading state")
@@ -203,6 +230,9 @@ func (l *LLama) SaveState(dst string) error {
 	w := C.CString("wb")
 	defer C.free(unsafe.Pointer(d)) // free allocated C string
 	defer C.free(unsafe.Pointer(w)) // free allocated C string
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
 	if C.save_state(l.state, d, w) != 0 {
 		return fmt.Errorf("error while saving state")
@@ -267,9 +297,13 @@ func (l *LLama) TokenEmbeddings(tokens []int, opts ...PredictOption) ([]float32,
 	params := newCPredictParams("", po)
 	defer params.free()
 
-	ret := C.get_token_embeddings(params.ptr, l.state, myArray, C.int(len(tokens)), (*C.float)(&floats[0]))
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	var cerr *C.char
+	ret := C.get_token_embeddings(params.ptr, l.state, myArray, C.int(len(tokens)), (*C.float)(&floats[0]), &cerr)
 	if ret != 0 {
-		return floats, fmt.Errorf("embedding inference failed")
+		return floats, fmt.Errorf("embedding inference failed: %w", bindingError(cerr, "unknown cause"))
 	}
 	return floats, nil
 }
@@ -295,9 +329,13 @@ func (l *LLama) Embeddings(text string, opts ...PredictOption) ([]float32, error
 	params := newCPredictParams(text, po)
 	defer params.free()
 
-	ret := C.get_embeddings(params.ptr, l.state, (*C.float)(&floats[0]))
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	var cerr *C.char
+	ret := C.get_embeddings(params.ptr, l.state, (*C.float)(&floats[0]), &cerr)
 	if ret != 0 {
-		return floats, fmt.Errorf("embedding inference failed")
+		return floats, fmt.Errorf("embedding inference failed: %w", bindingError(cerr, "unknown cause"))
 	}
 
 	return floats, nil
@@ -313,9 +351,13 @@ func (l *LLama) Eval(text string, opts ...PredictOption) error {
 	params := newCPredictParams(text, po)
 	defer params.free()
 
-	ret := C.eval(params.ptr, l.state, params.prompt)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	var cerr *C.char
+	ret := C.eval(params.ptr, l.state, params.prompt, &cerr)
 	if ret != 0 {
-		return fmt.Errorf("inference failed")
+		return fmt.Errorf("eval failed: %w", bindingError(cerr, "unknown cause"))
 	}
 
 	return nil
@@ -339,10 +381,14 @@ func (l *LLama) SpeculativeSampling(ll *LLama, text string, opts ...PredictOptio
 	params := newCPredictParams(text, po)
 	defer params.free()
 
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	var out *C.char
-	ret := C.speculative_sampling(params.ptr, l.state, ll.state, &out, C.bool(po.DebugMode))
+	var cerr *C.char
+	ret := C.speculative_sampling(params.ptr, l.state, ll.state, &out, C.bool(po.DebugMode), &cerr)
 	if ret != 0 {
-		return "", fmt.Errorf("inference failed")
+		return "", fmt.Errorf("inference failed: %w", bindingError(cerr, "unknown cause"))
 	}
 	if out == nil {
 		return "", fmt.Errorf("inference returned no output")
@@ -367,10 +413,14 @@ func (l *LLama) Predict(text string, opts ...PredictOption) (string, error) {
 	params := newCPredictParams(text, po)
 	defer params.free()
 
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	var out *C.char
-	ret := C.llama_predict(params.ptr, l.state, &out, C.bool(po.DebugMode))
+	var cerr *C.char
+	ret := C.llama_predict(params.ptr, l.state, &out, C.bool(po.DebugMode), &cerr)
 	if ret != 0 {
-		return "", fmt.Errorf("inference failed")
+		return "", fmt.Errorf("inference failed: %w", bindingError(cerr, "unknown cause"))
 	}
 	if out == nil {
 		return "", fmt.Errorf("inference returned no output")

@@ -13,3 +13,7 @@ Thumbs.db
 
 # model files downloaded by the test script
 ggllm-test-model.bin
+
+# editor tooling caches
+.cache/
+

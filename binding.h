@@ -10,7 +10,7 @@ extern unsigned char tokenCallback(void *, char *);
 
 int load_state(void *state, char *statefile, char*modes);
 
-int eval(void* params_ptr, void *ctx, char*text);
+int eval(void* params_ptr, void *ctx, char*text, char** error_out);
 
 int save_state(void *state, char *dst, char*modes);
 
@@ -35,12 +35,13 @@ void* load_model(const char *fname,
                  int flash_attention_type,
                  int n_ubatch,
                  int n_seq_max,
-                 bool mul_mat_q, const char *lora, const char *lora_base, bool perplexity
+                 bool mul_mat_q, const char *lora, const char *lora_base, bool perplexity,
+                 char **error_out
                  );
 
-int get_embeddings(void* params_ptr, void* state_pr, float * res_embeddings);
+int get_embeddings(void* params_ptr, void* state_pr, float * res_embeddings, char** error_out);
 
-int get_token_embeddings(void* params_ptr, void* state_pr,  int *tokens, int tokenSize, float * res_embeddings);
+int get_token_embeddings(void* params_ptr, void* state_pr,  int *tokens, int tokenSize, float * res_embeddings, char** error_out);
 
 int llama_embedding_size(void* state_pr);
 
@@ -52,7 +53,7 @@ void* llama_allocate_params(const char *prompt, int seed, int threads, int token
                             bool prompt_cache_ro, const char *grammar, float rope_freq_base, float rope_freq_scale, float negative_prompt_scale, const char* negative_prompt,
                             int n_draft);
 
-int speculative_sampling(void* params_ptr, void* target_model, void* draft_model, char** result, bool debug);
+int speculative_sampling(void* params_ptr, void* target_model, void* draft_model, char** result, bool debug, char** error_out);
 
 void llama_free_params(void* params_ptr);
 
@@ -62,7 +63,7 @@ int llama_tokenize_string(void* params_ptr, void* state_pr, int* result);
 
 int llama_detokenize_tokens(void* state_pr, const int* tokens, int token_count, bool remove_special, bool unparse_special, char** result);
 
-int llama_predict(void* params_ptr, void* state_pr, char** result, bool debug);
+int llama_predict(void* params_ptr, void* state_pr, char** result, bool debug, char** error_out);
 
 int llama_apply_chat_template(void* state_pr, const char** roles, const char** contents, int count, bool add_generation_prompt, char** result);
 

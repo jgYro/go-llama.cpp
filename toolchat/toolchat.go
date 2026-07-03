@@ -586,6 +586,10 @@ func stripMarkdownFence(body string) string {
 	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
 
+// EnvelopeGrammar builds the GBNF grammar for the JSON response protocol.
+// Each tool's "arguments" object is constrained by a grammar compiled from
+// its JSON schema (see SchemaGrammar for the supported subset); a schema the
+// converter cannot express falls back to a generic JSON object for that tool.
 func EnvelopeGrammar(tools []Tool, choice ToolChoice) (string, error) {
 	if choice == "" {
 		choice = ToolChoiceAuto
@@ -608,37 +612,27 @@ func EnvelopeGrammar(tools []Tool, choice ToolChoice) (string, error) {
 
 	toolRules := ""
 	if len(normalized) > 0 && choice != ToolChoiceNone {
-		parts := make([]string, 0, len(normalized))
-		for _, tool := range normalized {
-			parts = append(parts, grammarJSONStringLiteral(tool.Name)+" ws")
+		items := make([]string, 0, len(normalized))
+		var perTool strings.Builder
+		for i, tool := range normalized {
+			argsRule := "object"
+			conv := newSchemaConverter(fmt.Sprintf("tool-args-%d", i))
+			if name, convErr := conv.compileSchema(tool.Schema); convErr == nil {
+				argsRule = name
+				perTool.WriteString(conv.rulesText())
+			}
+
+			itemName := fmt.Sprintf("tool-item-%d", i)
+			items = append(items, itemName)
+			perTool.WriteString(itemName + ` ::= "{" ws "\"name\"" ws ":" ws ` + grammarJSONStringLiteral(tool.Name) + ` ws "," ws "\"arguments\"" ws ":" ws ` + argsRule + ` "}" ws` + "\n")
 		}
-		toolRules = `
-tool-call ::= "{" ws "\"type\"" ws ":" ws "\"tool_call\"" ws "," ws "\"tool_calls\"" ws ":" ws "[" ws tool-call-item ("," ws tool-call-item)* "]" ws "}" ws
-tool-call-item ::= "{" ws "\"name\"" ws ":" ws tool-name "," ws "\"arguments\"" ws ":" ws object "}" ws
-tool-name ::= ` + strings.Join(parts, " | ") + "\n"
+		toolRules = `tool-call ::= "{" ws "\"type\"" ws ":" ws "\"tool_call\"" ws "," ws "\"tool_calls\"" ws ":" ws "[" ws tool-call-item ("," ws tool-call-item)* "]" ws "}" ws
+tool-call-item ::= ` + strings.Join(items, " | ") + "\n" + perTool.String()
 	}
 
 	return root + `
-final ::= "{" ws "\"type\"" ws ":" ws "\"final\"" ws "," ws "\"content\"" ws ":" ws string "}" ws` + toolRules + `
-value  ::= object | array | string | number | ("true" | "false" | "null") ws
-object ::=
-  "{" ws (
-            string ":" ws value
-    ("," ws string ":" ws value)*
-  )? "}" ws
-array  ::=
-  "[" ws (
-            value
-    ("," ws value)*
-  )? "]" ws
-string ::=
-  "\"" (
-    [^"\\\x7F\x00-\x1F] |
-    "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
-  )* "\"" ws
-number ::= ("-"? ([0-9] | [1-9] [0-9]{0,15})) ("." [0-9]+)? ([eE] [-+]? [0-9] [1-9]{0,15})? ws
-ws ::= | " " | "\n" [ \t]{0,20}
-`, nil
+final ::= "{" ws "\"type\"" ws ":" ws "\"final\"" ws "," ws "\"content\"" ws ":" ws string "}" ws
+` + toolRules + jsonPrimitiveRules, nil
 }
 
 func grammarJSONStringLiteral(value string) string {
