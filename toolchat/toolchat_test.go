@@ -14,6 +14,8 @@ type fakeModel struct {
 	outputs  []string
 	prompts  []string
 	messages [][]llama.ChatMessage
+	grammars []string
+	tokens   []int
 }
 
 func (f *fakeModel) ApplyChatTemplate(messages []llama.ChatMessage, addGenerationPrompt bool) (string, error) {
@@ -35,6 +37,10 @@ func (f *fakeModel) ApplyChatTemplate(messages []llama.ChatMessage, addGeneratio
 }
 
 func (f *fakeModel) Predict(text string, opts ...llama.PredictOption) (string, error) {
+	po := llama.NewPredictOptions(opts...)
+	f.grammars = append(f.grammars, po.Grammar)
+	f.tokens = append(f.tokens, po.Tokens)
+
 	if len(f.outputs) == 0 {
 		return "", errors.New("no queued output")
 	}
@@ -100,6 +106,53 @@ func TestRunnerExecutesToolThenReturnsFinal(t *testing.T) {
 	lastMessage := model.messages[1][len(model.messages[1])-1]
 	if lastMessage.Role != "user" || !strings.Contains(lastMessage.Content, "temperature_f") {
 		t.Fatalf("second prompt did not include tool result: %+v", lastMessage)
+	}
+}
+
+func TestRunnerRequiredToolChoiceCanFinishAfterToolCall(t *testing.T) {
+	model := &fakeModel{outputs: []string{
+		`{"type":"tool_call","tool_calls":[{"name":"get_weather","arguments":{"city":"Boston"}}]}`,
+		`{"type":"final","content":"Boston is clear."}`,
+	}}
+	runner := Runner{
+		Model:      model,
+		ToolChoice: ToolChoiceRequired,
+		Tools: []Tool{{
+			Name: "get_weather",
+			Call: func(ctx context.Context, args json.RawMessage) (any, error) {
+				return map[string]string{"condition": "clear"}, nil
+			},
+		}},
+	}
+
+	resp, err := runner.Generate(context.Background(), []llama.ChatMessage{{Role: "user", Content: "Weather in Boston?"}})
+	if err != nil {
+		t.Fatalf("Generate returned error: %v", err)
+	}
+	if resp.Content != "Boston is clear." {
+		t.Fatalf("unexpected final content: %q", resp.Content)
+	}
+
+	if len(model.grammars) != 2 {
+		t.Fatalf("expected two predictions, got %d", len(model.grammars))
+	}
+	if !strings.Contains(model.grammars[0], "root ::= tool-call") {
+		t.Fatalf("first turn should force a tool call:\n%s", model.grammars[0])
+	}
+	if !strings.Contains(model.grammars[1], "root ::= final | tool-call") {
+		t.Fatalf("turns after a tool call must allow a final answer:\n%s", model.grammars[1])
+	}
+}
+
+func TestRunnerDefaultsToUnboundedTokenBudget(t *testing.T) {
+	model := &fakeModel{outputs: []string{`{"type":"final","content":"ok"}`}}
+	runner := Runner{Model: model}
+
+	if _, err := runner.Generate(context.Background(), []llama.ChatMessage{{Role: "user", Content: "hi"}}); err != nil {
+		t.Fatalf("Generate returned error: %v", err)
+	}
+	if len(model.tokens) != 1 || model.tokens[0] != 0 {
+		t.Fatalf("expected default token budget 0 (until EOG), got %v", model.tokens)
 	}
 }
 

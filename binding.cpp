@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -274,30 +275,60 @@ static bool file_exists(const std::string & path) {
     return file.good();
 }
 
-static bool ends_with_any(const std::string & text, const std::vector<std::string> & suffixes) {
-    for (const auto & suffix : suffixes) {
-        if (!suffix.empty() && text.size() >= suffix.size() &&
-            text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0) {
-            return true;
+// Find the earliest stop word occurrence that involves text appended at or after
+// appended_from. Matches may start before appended_from when a stop word spans
+// token pieces. Returns std::string::npos when no stop word matches.
+static size_t find_stop_position(const std::string & text, size_t appended_from, const std::vector<std::string> & stops) {
+    size_t best = std::string::npos;
+    for (const auto & stop : stops) {
+        if (stop.empty()) {
+            continue;
+        }
+        const size_t from = appended_from >= stop.size() - 1 ? appended_from - (stop.size() - 1) : 0;
+        const size_t pos = text.find(stop, from);
+        if (pos < best) {
+            best = pos;
         }
     }
-    return false;
+    return best;
 }
 
-static std::vector<float> parse_tensor_split(const char * tensor_split) {
-    std::vector<float> result;
+static bool parse_tensor_split(const char * tensor_split, std::vector<float> & result) {
+    result.clear();
     if (tensor_split == nullptr || tensor_split[0] == '\0') {
-        return result;
+        return true;
     }
 
     std::stringstream ss(tensor_split);
     std::string item;
     while (std::getline(ss, item, ',')) {
-        if (!item.empty()) {
-            result.push_back(std::stof(item));
+        if (item.empty()) {
+            continue;
         }
+        float value = 0.0f;
+        if (!parse_float(item, value)) {
+            return false;
+        }
+        result.push_back(value);
     }
-    return result;
+    return true;
+}
+
+static bool parse_main_gpu(const char * maingpu, int & result) {
+    char * end = nullptr;
+    errno = 0;
+    long value = std::strtol(maingpu, &end, 10);
+    if (errno != 0 || end == maingpu || value < 0 || value > INT_MAX) {
+        return false;
+    }
+    while (end != nullptr && *end != '\0') {
+        if (!std::isspace(static_cast<unsigned char>(*end))) {
+            return false;
+        }
+        end++;
+    }
+    result = static_cast<int>(value);
+    return true;
 }
 
 static std::string token_to_piece(const llama_vocab * vocab, llama_token token) {
@@ -331,17 +362,17 @@ static std::vector<llama_token> tokenize_text(const llama_vocab * vocab, const s
     return tokens;
 }
 
-static int decode_tokens(llama_context * ctx, std::vector<llama_token> & tokens, int batch_size) {
-    if (tokens.empty()) {
+static int decode_tokens(llama_context * ctx, llama_token * tokens, int count, int batch_size) {
+    if (count <= 0) {
         return 0;
     }
 
     int offset = 0;
     const int ctx_batch = std::max(1, static_cast<int>(llama_n_batch(ctx)));
     const int limit = std::max(1, std::min(batch_size, ctx_batch));
-    while (offset < static_cast<int>(tokens.size())) {
-        const int n = std::min(limit, static_cast<int>(tokens.size()) - offset);
-        llama_batch batch = llama_batch_get_one(tokens.data() + offset, n);
+    while (offset < count) {
+        const int n = std::min(limit, count - offset);
+        llama_batch batch = llama_batch_get_one(tokens + offset, n);
         int ret = llama_decode(ctx, batch);
         if (ret != 0) {
             return ret;
@@ -371,9 +402,12 @@ static llama_sampler * create_sampler(llama_binding_state * state, const llama_b
 
     if (!params->grammar.empty()) {
         llama_sampler * grammar = llama_sampler_init_grammar(state->vocab, params->grammar.c_str(), "root");
-        if (grammar != nullptr) {
-            llama_sampler_chain_add(sampler, grammar);
+        if (grammar == nullptr) {
+            fprintf(stderr, "%s: error: failed to parse grammar\n", __func__);
+            llama_sampler_free(sampler);
+            return nullptr;
         }
+        llama_sampler_chain_add(sampler, grammar);
     }
 
     if (params->mirostat == 1) {
@@ -449,7 +483,7 @@ static int embedding_for_tokens(llama_binding_state * state, std::vector<llama_t
     llama_set_embeddings(state->ctx, true);
     llama_set_n_threads(state->ctx, params->threads, params->threads);
 
-    int ret = decode_tokens(state->ctx, tokens, params->batch > 0 ? params->batch : static_cast<int>(llama_n_batch(state->ctx)));
+    int ret = decode_tokens(state->ctx, tokens.data(), static_cast<int>(tokens.size()), params->batch > 0 ? params->batch : static_cast<int>(llama_n_batch(state->ctx)));
     if (ret != 0) {
         return ret;
     }
@@ -512,13 +546,22 @@ void* load_model(const char *fname,
     model_params.use_mlock = mlock;
     model_params.use_mmap = mmap;
 
-    std::vector<float> tensor_split = parse_tensor_split(tensorsplit);
+    std::vector<float> tensor_split;
+    if (!parse_tensor_split(tensorsplit, tensor_split)) {
+        fprintf(stderr, "%s: error: invalid tensor split \"%s\"\n", __func__, tensorsplit);
+        return nullptr;
+    }
     if (!tensor_split.empty()) {
         model_params.tensor_split = tensor_split.data();
     }
 
     if (maingpu != nullptr && maingpu[0] != '\0') {
-        model_params.main_gpu = std::stoi(maingpu);
+        int main_gpu = 0;
+        if (!parse_main_gpu(maingpu, main_gpu)) {
+            fprintf(stderr, "%s: error: invalid main GPU \"%s\" (expected a device index)\n", __func__, maingpu);
+            return nullptr;
+        }
+        model_params.main_gpu = main_gpu;
     }
 
     llama_model * model = llama_model_load_from_file(fname, model_params);
@@ -728,7 +771,7 @@ int eval(void* params_ptr, void* state_pr, char *text) {
 
     llama_memory_clear(llama_get_memory(state->ctx), true);
     llama_set_n_threads(state->ctx, params->threads, params->threads);
-    return decode_tokens(state->ctx, tokens, params->batch > 0 ? params->batch : static_cast<int>(llama_n_batch(state->ctx)));
+    return decode_tokens(state->ctx, tokens.data(), static_cast<int>(tokens.size()), params->batch > 0 ? params->batch : static_cast<int>(llama_n_batch(state->ctx)));
 }
 
 int llama_predict(void* params_ptr, void* state_pr, char** result, bool debug) {
@@ -743,42 +786,63 @@ int llama_predict(void* params_ptr, void* state_pr, char** result, bool debug) {
         prompt_tokens.push_back(llama_vocab_bos(state->vocab));
     }
 
-    if (prompt_tokens.size() >= llama_n_ctx(state->ctx)) {
-        fprintf(stderr, "%s: prompt is too long (%zu tokens, context %u)\n", __func__, prompt_tokens.size(), llama_n_ctx(state->ctx));
+    const int n_ctx = static_cast<int>(llama_n_ctx(state->ctx));
+    if (static_cast<int>(prompt_tokens.size()) >= n_ctx) {
+        fprintf(stderr, "%s: prompt is too long (%zu tokens, context %d)\n", __func__, prompt_tokens.size(), n_ctx);
         return 1;
     }
 
-    bool loaded_prompt_cache = false;
-    std::vector<llama_token> cache_tokens;
+    llama_memory_t memory = llama_get_memory(state->ctx);
+
+    // Prompt cache: reuse the longest token prefix shared between the saved
+    // session and this prompt. An exact match reuses the restored logits and
+    // skips decoding entirely; otherwise the mismatched KV tail is dropped and
+    // only the remaining prompt suffix is decoded.
+    bool exact_cache = false;
+    size_t n_reused = 0;
     if (!params->session_file.empty() && file_exists(params->session_file)) {
-        cache_tokens.resize(static_cast<size_t>(llama_n_ctx(state->ctx)));
+        std::vector<llama_token> cache_tokens(static_cast<size_t>(n_ctx));
         size_t cache_count = 0;
         if (llama_state_load_file(state->ctx, params->session_file.c_str(), cache_tokens.data(), cache_tokens.size(), &cache_count)) {
             cache_tokens.resize(cache_count);
-            loaded_prompt_cache = cache_tokens == prompt_tokens;
+            while (n_reused < cache_tokens.size() && n_reused < prompt_tokens.size() &&
+                   cache_tokens[n_reused] == prompt_tokens[n_reused]) {
+                n_reused++;
+            }
+            exact_cache = n_reused == prompt_tokens.size() && cache_tokens.size() == prompt_tokens.size();
+            if (!exact_cache && n_reused >= prompt_tokens.size()) {
+                // The cache covers the whole prompt plus stale tokens; re-decode the
+                // final prompt token so the logits match the prompt, not the tail.
+                n_reused = prompt_tokens.size() - 1;
+            }
             if (debug) {
-                fprintf(stderr, "%s: loaded prompt cache %s (%zu tokens, exact=%s)\n",
+                fprintf(stderr, "%s: loaded prompt cache %s (%zu tokens, reusing %zu, exact=%s)\n",
                         __func__,
                         params->session_file.c_str(),
                         cache_tokens.size(),
-                        loaded_prompt_cache ? "true" : "false");
+                        n_reused,
+                        exact_cache ? "true" : "false");
             }
         } else if (debug) {
             fprintf(stderr, "%s: failed to load prompt cache %s\n", __func__, params->session_file.c_str());
         }
     }
 
-    if (!loaded_prompt_cache) {
-        llama_memory_clear(llama_get_memory(state->ctx), true);
+    if (!exact_cache) {
+        if (n_reused > 0) {
+            llama_memory_seq_rm(memory, 0, static_cast<llama_pos>(n_reused), -1);
+        } else {
+            llama_memory_clear(memory, true);
+        }
     }
     llama_set_embeddings(state->ctx, false);
     llama_set_n_threads(state->ctx, params->threads, params->threads);
 
     std::vector<llama_token> session_tokens = prompt_tokens;
     int ret = 0;
-    if (!loaded_prompt_cache) {
+    if (!exact_cache) {
         int batch_size = params->batch > 0 ? params->batch : static_cast<int>(llama_n_batch(state->ctx));
-        ret = decode_tokens(state->ctx, prompt_tokens, batch_size);
+        ret = decode_tokens(state->ctx, prompt_tokens.data() + n_reused, static_cast<int>(prompt_tokens.size() - n_reused), batch_size);
         if (ret != 0) {
             fprintf(stderr, "%s: prompt decode failed: %d\n", __func__, ret);
             return ret;
@@ -797,6 +861,8 @@ int llama_predict(void* params_ptr, void* state_pr, char** result, bool debug) {
     }
 
     std::string output;
+    int n_past = static_cast<int>(prompt_tokens.size());
+    bool context_shifted = false;
     int n_predict = params->tokens <= 0 ? 128 : params->tokens;
     for (int i = 0; i < n_predict; i++) {
         llama_token token = llama_sampler_sample(sampler, state->ctx, -1);
@@ -805,15 +871,31 @@ int llama_predict(void* params_ptr, void* state_pr, char** result, bool debug) {
         }
 
         std::string piece = token_to_piece(state->vocab, token);
+        const size_t appended_from = output.size();
         output += piece;
-        session_tokens.push_back(token);
 
         if (!tokenCallback(state, const_cast<char *>(piece.c_str()))) {
             break;
         }
 
-        if (ends_with_any(output, params->antiprompt)) {
+        const size_t stop_pos = find_stop_position(output, appended_from, params->antiprompt);
+        if (stop_pos != std::string::npos) {
+            output.resize(stop_pos);
             break;
+        }
+
+        // Context shift: when the context fills up, discard half of the tokens
+        // after n_keep and slide the rest back so generation can continue.
+        if (n_past + 1 >= n_ctx) {
+            const int n_keep = std::max(0, std::min(params->n_keep, n_past - 1));
+            const int n_discard = (n_past - n_keep) / 2;
+            if (n_discard <= 0 || !llama_memory_can_shift(memory)) {
+                break;
+            }
+            llama_memory_seq_rm(memory, 0, n_keep, n_keep + n_discard);
+            llama_memory_seq_add(memory, 0, n_keep + n_discard, n_past, -n_discard);
+            n_past -= n_discard;
+            context_shifted = true;
         }
 
         llama_batch batch = llama_batch_get_one(&token, 1);
@@ -823,10 +905,14 @@ int llama_predict(void* params_ptr, void* state_pr, char** result, bool debug) {
             llama_sampler_free(sampler);
             return ret;
         }
+        n_past++;
+        session_tokens.push_back(token);
     }
 
     llama_sampler_free(sampler);
-    if (!params->session_file.empty() && !params->prompt_cache_ro && params->prompt_cache_all) {
+    // Skip the save after a context shift: the KV positions no longer match a
+    // linear token list, so a saved session would corrupt later cache loads.
+    if (!params->session_file.empty() && !params->prompt_cache_ro && params->prompt_cache_all && !context_shifted) {
         if (!llama_state_save_file(state->ctx, params->session_file.c_str(), session_tokens.data(), session_tokens.size()) && debug) {
             fprintf(stderr, "%s: failed to save final prompt cache %s\n", __func__, params->session_file.c_str());
         }
@@ -840,6 +926,7 @@ int llama_predict(void* params_ptr, void* state_pr, char** result, bool debug) {
 
 int speculative_sampling(void* params_ptr, void* target_model, void* draft_model, char** result, bool debug) {
     (void) draft_model;
+    fprintf(stderr, "%s: warning: speculative decoding is not implemented in this binding; the draft model is unused and generation falls back to standard prediction\n", __func__);
     return llama_predict(params_ptr, target_model, result, debug);
 }
 

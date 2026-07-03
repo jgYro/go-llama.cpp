@@ -77,6 +77,7 @@ type runnerConfig struct {
 	disableGrammar  bool
 	failOnToolError bool
 	grammar         string
+	followupGrammar string
 }
 
 func (r Runner) Generate(ctx context.Context, messages []llama.ChatMessage) (Response, error) {
@@ -100,8 +101,12 @@ func (r Runner) Generate(ctx context.Context, messages []llama.ChatMessage) (Res
 		}
 
 		opts := append([]llama.PredictOption(nil), cfg.predictOptions...)
-		if !cfg.disableGrammar && cfg.grammar != "" {
-			opts = append(opts, llama.WithGrammar(cfg.grammar))
+		grammar := cfg.grammar
+		if len(resp.ToolResults) > 0 {
+			grammar = cfg.followupGrammar
+		}
+		if !cfg.disableGrammar && grammar != "" {
+			opts = append(opts, llama.WithGrammar(grammar))
 		}
 
 		raw, err := cfg.model.Predict(prompt, opts...)
@@ -171,24 +176,40 @@ func (r Runner) prepare() (*runnerConfig, error) {
 	}
 
 	grammar := ""
+	followupGrammar := ""
 	if !r.DisableGrammar {
 		grammar, err = EnvelopeGrammar(tools, choice)
 		if err != nil {
 			return nil, err
 		}
+		followupGrammar = grammar
+		if choice == ToolChoiceRequired {
+			// "required" means the model must call a tool before answering. Once a
+			// tool has run, later turns must be able to emit a final envelope, so
+			// they use the auto grammar instead of the tool-call-only one.
+			followupGrammar, err = EnvelopeGrammar(tools, ToolChoiceAuto)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
+
+	// Default to generating until end-of-generation so JSON envelopes are never
+	// truncated at llama's 128-token default; caller options take precedence.
+	predictOptions := append([]llama.PredictOption{llama.SetTokens(0)}, r.PredictOptions...)
 
 	return &runnerConfig{
 		model:           r.Model,
 		tools:           tools,
 		toolsByName:     toolsByName,
 		maxTurns:        maxTurns,
-		predictOptions:  append([]llama.PredictOption(nil), r.PredictOptions...),
+		predictOptions:  predictOptions,
 		systemPrompt:    systemPrompt(r.SystemPrompt, tools, choice),
 		toolChoice:      choice,
 		disableGrammar:  r.DisableGrammar,
 		failOnToolError: r.FailOnToolError,
 		grammar:         grammar,
+		followupGrammar: followupGrammar,
 	}, nil
 }
 

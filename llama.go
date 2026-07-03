@@ -321,6 +321,9 @@ func (l *LLama) Eval(text string, opts ...PredictOption) error {
 	return nil
 }
 
+// SpeculativeSampling is retained for API compatibility. True speculative
+// decoding is not wired to the modern llama.cpp API yet: the draft model is
+// unused and generation falls back to standard prediction on the target model.
 func (l *LLama) SpeculativeSampling(ll *LLama, text string, opts ...PredictOption) (string, error) {
 	po := NewPredictOptions(opts...)
 
@@ -346,7 +349,7 @@ func (l *LLama) SpeculativeSampling(ll *LLama, text string, opts ...PredictOptio
 	}
 	defer C.free(unsafe.Pointer(out))
 
-	return cleanPredictionResult(C.GoString(out), text, po.StopPrompts), nil
+	return cleanPredictionResult(C.GoString(out), po.StopPrompts), nil
 }
 
 func (l *LLama) Predict(text string, opts ...PredictOption) (string, error) {
@@ -374,7 +377,7 @@ func (l *LLama) Predict(text string, opts ...PredictOption) (string, error) {
 	}
 	defer C.free(unsafe.Pointer(out))
 
-	return cleanPredictionResult(C.GoString(out), text, po.StopPrompts), nil
+	return cleanPredictionResult(C.GoString(out), po.StopPrompts), nil
 }
 
 func (l *LLama) ApplyChatTemplate(messages []ChatMessage, addGenerationPrompt bool) (string, error) {
@@ -451,11 +454,10 @@ func (l *LLama) Detokenize(tokens []int32, removeSpecial, unparseSpecial bool) (
 	return C.GoString(out), nil
 }
 
-func cleanPredictionResult(res, prompt string, stopPrompts []string) string {
-	res = strings.TrimPrefix(res, " ")
-	res = strings.TrimPrefix(res, prompt)
-	res = strings.TrimPrefix(res, "\n")
-
+// cleanPredictionResult trims a trailing stop word from the result. The binding
+// returns only generated text (no prompt echo), so leading characters are
+// legitimate output and must be preserved.
+func cleanPredictionResult(res string, stopPrompts []string) string {
 	for _, s := range stopPrompts {
 		if s != "" {
 			res = strings.TrimSuffix(res, s)
