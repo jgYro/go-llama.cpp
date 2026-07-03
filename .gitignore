@@ -17,3 +17,7 @@ ggllm-test-model.bin
 # editor tooling caches
 .cache/
 
+
+# machine-local workspace file
+go.work
+go.work.sum
