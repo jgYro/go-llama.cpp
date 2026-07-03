@@ -493,20 +493,47 @@ static int embedding_for_tokens(llama_binding_state * state, std::vector<llama_t
         tokens.push_back(llama_vocab_bos(state->vocab));
     }
 
+    // Pooling needs every token's output in one pass, so the input must fit a
+    // single batch.
+    const int n_batch = std::max(1, static_cast<int>(llama_n_batch(state->ctx)));
+    if (static_cast<int>(tokens.size()) > n_batch) {
+        set_binding_error(error_out, "embedding input is too long (" + std::to_string(tokens.size()) + " tokens, batch " + std::to_string(n_batch) + ")");
+        return 1;
+    }
+
     llama_memory_clear(llama_get_memory(state->ctx), true);
     llama_set_embeddings(state->ctx, true);
     llama_set_n_threads(state->ctx, params->threads, params->threads);
 
-    int ret = decode_tokens(state->ctx, tokens.data(), static_cast<int>(tokens.size()), params->batch > 0 ? params->batch : static_cast<int>(llama_n_batch(state->ctx)));
+    llama_batch batch = llama_batch_init(static_cast<int32_t>(tokens.size()), 0, 1);
+    for (size_t i = 0; i < tokens.size(); i++) {
+        batch.token[i] = tokens[i];
+        batch.pos[i] = static_cast<llama_pos>(i);
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i] = true;
+    }
+    batch.n_tokens = static_cast<int32_t>(tokens.size());
+
+    int ret;
+    if (llama_model_has_encoder(state->model) && !llama_model_has_decoder(state->model)) {
+        ret = llama_encode(state->ctx, batch);
+    } else {
+        ret = llama_decode(state->ctx, batch);
+    }
+    llama_batch_free(batch);
     if (ret != 0) {
         set_binding_error(error_out, "embedding decode failed with code " + std::to_string(ret));
         return ret;
     }
 
     const int n_embd = llama_model_n_embd_out(state->model);
-    float * embeddings = llama_get_embeddings_ith(state->ctx, -1);
-    if (embeddings == nullptr) {
+    float * embeddings = nullptr;
+    if (llama_pooling_type(state->ctx) != LLAMA_POOLING_TYPE_NONE) {
         embeddings = llama_get_embeddings_seq(state->ctx, 0);
+    }
+    if (embeddings == nullptr) {
+        embeddings = llama_get_embeddings_ith(state->ctx, -1);
     }
     if (embeddings == nullptr) {
         embeddings = llama_get_embeddings(state->ctx);
