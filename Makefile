@@ -10,7 +10,7 @@ BUILD_TYPE ?=
 BUILD_DIR ?= build
 
 CFLAGS   := -I./llama.cpp/include -I./llama.cpp/ggml/include -I. -O3 -DNDEBUG -std=c11 -fPIC
-CXXFLAGS := -I./llama.cpp/include -I./llama.cpp/ggml/include -I./llama.cpp/ggml/src -I. -O3 -DNDEBUG -std=c++17 -fPIC
+CXXFLAGS := -I./llama.cpp/include -I./llama.cpp/ggml/include -I./llama.cpp/ggml/src -I./llama.cpp/tools/mtmd -I. -O3 -DNDEBUG -std=c++17 -fPIC
 LDFLAGS  :=
 
 CFLAGS   += -Wall -Wextra -Wpedantic -Wcast-qual -Wdouble-promotion -Wshadow -Wstrict-prototypes -Wpointer-arith -Wno-unused-function
@@ -39,6 +39,7 @@ CMAKE_ARGS := \
 	-DLLAMA_BUILD_EXAMPLES=OFF \
 	-DLLAMA_BUILD_SERVER=OFF \
 	-DLLAMA_BUILD_TOOLS=OFF \
+	-DLLAMA_BUILD_MTMD=ON \
 	-DLLAMA_BUILD_APP=OFF
 
 ifeq ($(UNAME_S),Darwin)
@@ -84,13 +85,13 @@ $(info )
 
 llama-build:
 	cmake -S llama.cpp -B $(BUILD_DIR) $(CMAKE_ARGS)
-	cmake --build $(BUILD_DIR) --config Release --target llama
+	cmake --build $(BUILD_DIR) --config Release --target llama --target mtmd
 
 binding.o: binding.cpp binding.h llama.cpp/include/llama.h
 	$(CXX) $(CXXFLAGS) binding.cpp -o binding.o -c
 
 libbinding.a: llama-build binding.o
-	@libs="$(BUILD_DIR)/src/libllama.a $(BUILD_DIR)/ggml/src/libggml.a $(BUILD_DIR)/ggml/src/libggml-base.a $(BUILD_DIR)/ggml/src/libggml-cpu.a $$(find "$(BUILD_DIR)/ggml/src" -mindepth 2 -name 'libggml*.a' | sort)"; \
+	@libs="$(BUILD_DIR)/src/libllama.a $(BUILD_DIR)/tools/mtmd/libmtmd.a $(BUILD_DIR)/ggml/src/libggml.a $(BUILD_DIR)/ggml/src/libggml-base.a $(BUILD_DIR)/ggml/src/libggml-cpu.a $$(find "$(BUILD_DIR)/ggml/src" -mindepth 2 -name 'libggml*.a' | sort)"; \
 	if [ -z "$$libs" ]; then \
 		echo "no llama.cpp static libraries found under $(BUILD_DIR)"; \
 		exit 1; \

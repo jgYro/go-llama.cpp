@@ -218,6 +218,39 @@ With `ToolChoiceRequired` the first turn must call a tool; later turns may answe
 are fed back to the model as results unless `FailOnToolError: true`. Set `DisableGrammar: true`
 to rely on prompting alone.
 
+### Multimodal (images and audio)
+
+Load a multimodal projector (mmproj GGUF) alongside the text model, then attach
+media files to predictions. Wrap media prompts in the model's chat template with
+the media marker inside the user message:
+
+```go
+model, err := llama.New("granite-vision-4.1-4b-Q4_K_M.gguf",
+	llama.SetContext(8192),           // vision models need room for image tokens
+	llama.SetNBatch(2048),
+	llama.SetGPULayers(99),
+	llama.SetMMProj("mmproj-model-f16.gguf"),
+)
+
+prompt, err := model.ApplyChatTemplate([]llama.ChatMessage{
+	{Role: "user", Content: llama.MediaMarker() + "\nWhat is shown in this image?"},
+}, true)
+
+out, err := model.Predict(prompt, llama.WithMedia("photo.jpg"), llama.SetTokens(0))
+```
+
+One `llama.MediaMarker()` (`<__media__>`) positions each media file in the
+prompt; when the prompt contains no marker, one is prepended per file. Images
+(jpg/png/bmp/gif) and audio (wav/mp3/flac, for audio-capable models) are decoded
+automatically; grammar constraints, streaming callbacks, and stop words all
+apply to multimodal predictions too. `model.SupportsVision()` /
+`model.SupportsAudio()` report projector capabilities. A media prediction
+without a loaded projector returns an explicit error.
+
+Ollama blobs work directly as model and projector paths — resolve the `model`
+and `projector` layer digests from the manifest under
+`~/.ollama/models/manifests/`.
+
 ### Embeddings
 
 ```go
@@ -390,8 +423,10 @@ The Makefile does not patch the submodule. If an upstream update changes public 
   warning; the draft model is unused.
 - Options retained for compatibility but currently inert: `SetTailFreeSamplingZ`,
   `SetPenalizeNL`, `EnableF16KV`, `SetNegativePrompt`/`SetNegativePromptScale`, `SetNDraft`.
-- No multimodal (image/audio), no reranking, no runtime LoRA management, no continuous
-  batching, and no embedded HTTP server — this is a library wrapper, not `llama-server`.
+- Multimodal predictions do not context-shift (media token positions cannot be slid), skip the
+  prompt cache, and video input needs an `ffmpeg` binary in PATH at runtime.
+- No reranking, no runtime LoRA management, no continuous batching, and no embedded HTTP
+  server — this is a library wrapper, not `llama-server`.
 
 ## License
 

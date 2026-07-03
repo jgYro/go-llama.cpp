@@ -25,6 +25,7 @@ type ModelOptions struct {
 	LoraBase       string
 	LoraAdapter    string
 	Perplexity     bool
+	MMProj         string
 }
 
 type PredictOptions struct {
@@ -67,6 +68,7 @@ type PredictOptions struct {
 	Grammar                     string
 	MainGPU                     string
 	TensorSplit                 string
+	MediaPaths                  []string
 
 	// Rope parameters
 	RopeFreqBase  float32
@@ -326,6 +328,14 @@ func SetPerplexity(b bool) ModelOption {
 	}
 }
 
+// SetMMProj loads a multimodal projector (mmproj GGUF) alongside the model,
+// enabling image/audio input via WithMedia.
+func SetMMProj(path string) ModelOption {
+	return func(p *ModelOptions) {
+		p.MMProj = path
+	}
+}
+
 // SetNegativePromptScale is retained for API compatibility. CFG guidance is not wired yet.
 func SetNegativePromptScale(nps float32) PredictOption {
 	return func(p *PredictOptions) {
@@ -393,6 +403,16 @@ var IgnoreEOS PredictOption = func(p *PredictOptions) {
 func WithGrammar(s string) PredictOption {
 	return func(p *PredictOptions) {
 		p.Grammar = s
+	}
+}
+
+// WithMedia attaches media files (images; audio for models that support it)
+// to the prediction. The prompt should reference each file with the
+// MediaMarker() placeholder; markers are prepended automatically when absent.
+// Requires a model loaded with SetMMProj.
+func WithMedia(paths ...string) PredictOption {
+	return func(p *PredictOptions) {
+		p.MediaPaths = append(p.MediaPaths, paths...)
 	}
 }
 

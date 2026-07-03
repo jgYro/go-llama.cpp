@@ -3,6 +3,8 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "llama.h"
+#include "mtmd.h"
+#include "mtmd-helper.h"
 
 #include <algorithm>
 #include <cctype>
@@ -64,6 +66,7 @@ struct llama_binding_state {
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;
     const llama_vocab * vocab = nullptr;
+    mtmd_context * mtmd = nullptr;
     std::vector<float> tensor_split;
     std::vector<llama_adapter_lora *> adapters;
 };
@@ -483,6 +486,72 @@ static llama_sampler * create_sampler(llama_binding_state * state, const llama_b
     return sampler;
 }
 
+// Samples tokens until the budget, an end-of-generation token, a stop word, or
+// a declined token callback ends generation. When allow_shift is set the
+// context slides via the n_keep context shift once full; otherwise generation
+// stops gracefully at the context limit (media chunk positions cannot be
+// shifted safely). session_tokens, when provided, receives every decoded token.
+static int generate_tokens(llama_binding_state * state, const llama_binding_params * params, llama_sampler * sampler,
+                           int n_past, bool allow_shift, std::vector<llama_token> * session_tokens,
+                           bool * context_shifted, std::string & output, char ** error_out) {
+    const int n_ctx = static_cast<int>(llama_n_ctx(state->ctx));
+    llama_memory_t memory = llama_get_memory(state->ctx);
+
+    int n_predict = params->tokens <= 0 ? 128 : params->tokens;
+    for (int i = 0; i < n_predict; i++) {
+        llama_token token = llama_sampler_sample(sampler, state->ctx, -1);
+        if (llama_vocab_is_eog(state->vocab, token)) {
+            break;
+        }
+
+        std::string piece = token_to_piece(state->vocab, token);
+        const size_t appended_from = output.size();
+        output += piece;
+
+        if (!tokenCallback(state, const_cast<char *>(piece.c_str()))) {
+            break;
+        }
+
+        const size_t stop_pos = find_stop_position(output, appended_from, params->antiprompt);
+        if (stop_pos != std::string::npos) {
+            output.resize(stop_pos);
+            break;
+        }
+
+        // Context shift: when the context fills up, discard half of the tokens
+        // after n_keep and slide the rest back so generation can continue.
+        if (n_past + 1 >= n_ctx) {
+            if (!allow_shift || !llama_memory_can_shift(memory)) {
+                break;
+            }
+            const int n_keep = std::max(0, std::min(params->n_keep, n_past - 1));
+            const int n_discard = (n_past - n_keep) / 2;
+            if (n_discard <= 0) {
+                break;
+            }
+            llama_memory_seq_rm(memory, 0, n_keep, n_keep + n_discard);
+            llama_memory_seq_add(memory, 0, n_keep + n_discard, n_past, -n_discard);
+            n_past -= n_discard;
+            if (context_shifted != nullptr) {
+                *context_shifted = true;
+            }
+        }
+
+        llama_batch batch = llama_batch_get_one(&token, 1);
+        int ret = llama_decode(state->ctx, batch);
+        if (ret != 0) {
+            set_binding_error(error_out, "token decode failed with code " + std::to_string(ret));
+            return ret;
+        }
+        n_past++;
+        if (session_tokens != nullptr) {
+            session_tokens->push_back(token);
+        }
+    }
+
+    return 0;
+}
+
 static int embedding_for_tokens(llama_binding_state * state, std::vector<llama_token> & tokens, llama_binding_params * params, float * res_embeddings, char ** error_out) {
     if (state == nullptr || state->ctx == nullptr || state->model == nullptr || res_embeddings == nullptr) {
         set_binding_error(error_out, "embeddings called without a loaded model");
@@ -750,6 +819,10 @@ void llama_binding_free_model(void* state_pr) {
         return;
     }
 
+    if (state->mtmd != nullptr) {
+        mtmd_free(state->mtmd);
+    }
+
     if (state->ctx != nullptr) {
         llama_free(state->ctx);
     }
@@ -913,55 +986,12 @@ int llama_predict(void* params_ptr, void* state_pr, char** result, bool debug, c
     }
 
     std::string output;
-    int n_past = static_cast<int>(prompt_tokens.size());
     bool context_shifted = false;
-    int n_predict = params->tokens <= 0 ? 128 : params->tokens;
-    for (int i = 0; i < n_predict; i++) {
-        llama_token token = llama_sampler_sample(sampler, state->ctx, -1);
-        if (llama_vocab_is_eog(state->vocab, token)) {
-            break;
-        }
-
-        std::string piece = token_to_piece(state->vocab, token);
-        const size_t appended_from = output.size();
-        output += piece;
-
-        if (!tokenCallback(state, const_cast<char *>(piece.c_str()))) {
-            break;
-        }
-
-        const size_t stop_pos = find_stop_position(output, appended_from, params->antiprompt);
-        if (stop_pos != std::string::npos) {
-            output.resize(stop_pos);
-            break;
-        }
-
-        // Context shift: when the context fills up, discard half of the tokens
-        // after n_keep and slide the rest back so generation can continue.
-        if (n_past + 1 >= n_ctx) {
-            const int n_keep = std::max(0, std::min(params->n_keep, n_past - 1));
-            const int n_discard = (n_past - n_keep) / 2;
-            if (n_discard <= 0 || !llama_memory_can_shift(memory)) {
-                break;
-            }
-            llama_memory_seq_rm(memory, 0, n_keep, n_keep + n_discard);
-            llama_memory_seq_add(memory, 0, n_keep + n_discard, n_past, -n_discard);
-            n_past -= n_discard;
-            context_shifted = true;
-        }
-
-        llama_batch batch = llama_batch_get_one(&token, 1);
-        ret = llama_decode(state->ctx, batch);
-        if (ret != 0) {
-            set_binding_error(error_out, "token decode failed with code " + std::to_string(ret));
-            llama_sampler_free(sampler);
-            return ret;
-        }
-        n_past++;
-        session_tokens.push_back(token);
-    }
-
+    ret = generate_tokens(state, params, sampler, static_cast<int>(prompt_tokens.size()), true, &session_tokens, &context_shifted, output, error_out);
     llama_sampler_free(sampler);
+    if (ret != 0) {
+        return ret;
+    }
     // Skip the save after a context shift: the KV positions no longer match a
     // linear token list, so a saved session would corrupt later cache loads.
     if (!params->session_file.empty() && !params->prompt_cache_ro && params->prompt_cache_all && !context_shifted) {
@@ -980,6 +1010,137 @@ int speculative_sampling(void* params_ptr, void* target_model, void* draft_model
     (void) draft_model;
     fprintf(stderr, "%s: warning: speculative decoding is not implemented in this binding; the draft model is unused and generation falls back to standard prediction\n", __func__);
     return llama_predict(params_ptr, target_model, result, debug, error_out);
+}
+
+const char* llama_binding_media_marker(void) {
+    return mtmd_default_marker();
+}
+
+int llama_binding_load_mmproj(void* state_pr, const char* path, bool use_gpu, int threads, char** error_out) {
+    llama_binding_state * state = static_cast<llama_binding_state *>(state_pr);
+    if (state == nullptr || state->model == nullptr || path == nullptr || path[0] == '\0') {
+        set_binding_error(error_out, "loading a multimodal projector requires a loaded model and a projector path");
+        return 1;
+    }
+
+    mtmd_context_params mparams = mtmd_context_params_default();
+    mparams.use_gpu = use_gpu;
+    mparams.print_timings = false;
+    if (threads > 0) {
+        mparams.n_threads = threads;
+    }
+
+    mtmd_context * mtmd = mtmd_init_from_file(path, state->model, mparams);
+    if (mtmd == nullptr) {
+        set_binding_error(error_out, std::string("failed to load multimodal projector ") + path);
+        return 1;
+    }
+
+    if (state->mtmd != nullptr) {
+        mtmd_free(state->mtmd);
+    }
+    state->mtmd = mtmd;
+    return 0;
+}
+
+int llama_binding_supports_vision(void* state_pr) {
+    llama_binding_state * state = static_cast<llama_binding_state *>(state_pr);
+    return state != nullptr && state->mtmd != nullptr && mtmd_support_vision(state->mtmd) ? 1 : 0;
+}
+
+int llama_binding_supports_audio(void* state_pr) {
+    llama_binding_state * state = static_cast<llama_binding_state *>(state_pr);
+    return state != nullptr && state->mtmd != nullptr && mtmd_support_audio(state->mtmd) ? 1 : 0;
+}
+
+int llama_predict_mtmd(void* params_ptr, void* state_pr, const char** media_paths, int media_count, char** result, bool debug, char** error_out) {
+    llama_binding_params * params = static_cast<llama_binding_params *>(params_ptr);
+    llama_binding_state * state = static_cast<llama_binding_state *>(state_pr);
+    if (params == nullptr || state == nullptr || state->ctx == nullptr || result == nullptr || media_count < 0) {
+        set_binding_error(error_out, "multimodal prediction called without a loaded model");
+        return 1;
+    }
+    if (state->mtmd == nullptr) {
+        set_binding_error(error_out, "no multimodal projector loaded; load the model with a projector (mmproj) file");
+        return 1;
+    }
+
+    llama_memory_clear(llama_get_memory(state->ctx), true);
+    llama_set_embeddings(state->ctx, false);
+    llama_set_n_threads(state->ctx, params->threads, params->threads);
+
+    std::vector<mtmd_bitmap *> bitmaps;
+    std::vector<mtmd_helper_video *> videos;
+    auto release_media = [&]() {
+        for (auto * bitmap : bitmaps) {
+            mtmd_bitmap_free(bitmap);
+        }
+        for (auto * video : videos) {
+            mtmd_helper_video_free(video);
+        }
+    };
+
+    for (int i = 0; i < media_count; i++) {
+        mtmd_helper_bitmap_wrapper wrapper = mtmd_helper_bitmap_init_from_file(state->mtmd, media_paths[i], false);
+        if (wrapper.bitmap == nullptr) {
+            release_media();
+            set_binding_error(error_out, std::string("failed to load media file ") + media_paths[i]);
+            return 1;
+        }
+        bitmaps.push_back(wrapper.bitmap);
+        if (wrapper.video_ctx != nullptr) {
+            videos.push_back(wrapper.video_ctx);
+        }
+    }
+
+    mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+    mtmd_input_text text;
+    text.text = params->prompt.c_str();
+    text.add_special = true;
+    text.parse_special = true;
+
+    int32_t ret = mtmd_tokenize(state->mtmd, chunks, &text,
+                                const_cast<const mtmd_bitmap **>(bitmaps.data()), bitmaps.size());
+    if (ret != 0) {
+        mtmd_input_chunks_free(chunks);
+        release_media();
+        if (ret == 1) {
+            set_binding_error(error_out, "number of media files does not match the media markers in the prompt");
+        } else {
+            set_binding_error(error_out, "media preprocessing failed with code " + std::to_string(ret));
+        }
+        return ret;
+    }
+
+    const int batch_size = params->batch > 0 ? params->batch : static_cast<int>(llama_n_batch(state->ctx));
+    llama_pos n_past = 0;
+    ret = mtmd_helper_eval_chunks(state->mtmd, state->ctx, chunks, 0, 0, batch_size, true, &n_past);
+    mtmd_input_chunks_free(chunks);
+    release_media();
+    if (ret != 0) {
+        set_binding_error(error_out, "multimodal prompt evaluation failed with code " + std::to_string(ret));
+        return ret;
+    }
+
+    llama_sampler * sampler = create_sampler(state, params, error_out);
+    if (sampler == nullptr) {
+        return 1;
+    }
+
+    // No context shift here: media chunk positions (M-RoPE in particular)
+    // cannot be slid safely, so generation stops at the context limit instead.
+    std::string output;
+    int gen_ret = generate_tokens(state, params, sampler, static_cast<int>(n_past), false, nullptr, nullptr, output, error_out);
+    llama_sampler_free(sampler);
+    if (gen_ret != 0) {
+        return gen_ret;
+    }
+
+    if (debug) {
+        llama_perf_context_print(state->ctx);
+        llama_perf_context_reset(state->ctx);
+    }
+    return copy_result_string(output, result);
 }
 
 int llama_tokenize_string(void* params_ptr, void* state_pr, int* result) {

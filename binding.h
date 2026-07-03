@@ -55,6 +55,16 @@ void* llama_allocate_params(const char *prompt, int seed, int threads, int token
 
 int speculative_sampling(void* params_ptr, void* target_model, void* draft_model, char** result, bool debug, char** error_out);
 
+const char* llama_binding_media_marker(void);
+
+int llama_binding_load_mmproj(void* state, const char* path, bool use_gpu, int threads, char** error_out);
+
+int llama_binding_supports_vision(void* state);
+
+int llama_binding_supports_audio(void* state);
+
+int llama_predict_mtmd(void* params_ptr, void* state_pr, const char** media_paths, int media_count, char** result, bool debug, char** error_out);
+
 void llama_free_params(void* params_ptr);
 
 void llama_binding_free_model(void* state);

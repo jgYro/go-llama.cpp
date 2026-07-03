@@ -1,6 +1,6 @@
 package llama
 
-// #cgo CXXFLAGS: -I${SRCDIR}/llama.cpp/include -I${SRCDIR}/llama.cpp/ggml/include -I${SRCDIR}/llama.cpp/ggml/src -std=c++17
+// #cgo CXXFLAGS: -I${SRCDIR}/llama.cpp/include -I${SRCDIR}/llama.cpp/ggml/include -I${SRCDIR}/llama.cpp/ggml/src -I${SRCDIR}/llama.cpp/tools/mtmd -std=c++17
 // #cgo LDFLAGS: -L${SRCDIR}/ -lbinding -lm
 // #cgo linux LDFLAGS: -lstdc++
 // #cgo darwin LDFLAGS: -lc++ -framework Accelerate -framework Foundation -framework Metal -framework MetalKit -framework MetalPerformanceShaders
@@ -174,8 +174,34 @@ func New(model string, opts ...ModelOption) (*LLama, error) {
 		return nil, fmt.Errorf("failed loading model: %w", bindingError(cerr, "unknown cause"))
 	}
 
+	if mo.MMProj != "" {
+		mmproj := C.CString(mo.MMProj)
+		defer C.free(unsafe.Pointer(mmproj))
+		var mmerr *C.char
+		if C.llama_binding_load_mmproj(result, mmproj, C.bool(mo.NGPULayers > 0), C.int(0), &mmerr) != 0 {
+			C.llama_binding_free_model(result)
+			return nil, fmt.Errorf("failed loading model: %w", bindingError(mmerr, "unknown cause"))
+		}
+	}
+
 	ll := &LLama{state: result, contextSize: mo.ContextSize, embeddings: mo.Embeddings}
 	return ll, nil
+}
+
+// MediaMarker is the placeholder that positions a media file inside a prompt,
+// e.g. "<__media__>\nDescribe this image." One marker per WithMedia file.
+func MediaMarker() string {
+	return C.GoString(C.llama_binding_media_marker())
+}
+
+// SupportsVision reports whether a multimodal projector with image support is loaded.
+func (l *LLama) SupportsVision() bool {
+	return l.state != nil && C.llama_binding_supports_vision(l.state) != 0
+}
+
+// SupportsAudio reports whether a multimodal projector with audio support is loaded.
+func (l *LLama) SupportsAudio() bool {
+	return l.state != nil && C.llama_binding_supports_audio(l.state) != 0
 }
 
 func BuiltinChatTemplates() ([]string, error) {
@@ -410,6 +436,15 @@ func (l *LLama) Predict(text string, opts ...PredictOption) (string, error) {
 		po.Tokens = 99999999
 	}
 
+	// Media prompts route through the multimodal path. Each file needs one
+	// marker in the prompt; prepend them when the prompt has none.
+	if len(po.MediaPaths) > 0 {
+		marker := MediaMarker()
+		if !strings.Contains(text, marker) {
+			text = strings.Repeat(marker+"\n", len(po.MediaPaths)) + text
+		}
+	}
+
 	params := newCPredictParams(text, po)
 	defer params.free()
 
@@ -418,7 +453,16 @@ func (l *LLama) Predict(text string, opts ...PredictOption) (string, error) {
 
 	var out *C.char
 	var cerr *C.char
-	ret := C.llama_predict(params.ptr, l.state, &out, C.bool(po.DebugMode), &cerr)
+	var ret C.int
+	if len(po.MediaPaths) > 0 {
+		media := make([]*C.char, len(po.MediaPaths))
+		for i, path := range po.MediaPaths {
+			media[i] = params.cString(path)
+		}
+		ret = C.llama_predict_mtmd(params.ptr, l.state, (**C.char)(unsafe.Pointer(&media[0])), C.int(len(media)), &out, C.bool(po.DebugMode), &cerr)
+	} else {
+		ret = C.llama_predict(params.ptr, l.state, &out, C.bool(po.DebugMode), &cerr)
+	}
 	if ret != 0 {
 		return "", fmt.Errorf("inference failed: %w", bindingError(cerr, "unknown cause"))
 	}
